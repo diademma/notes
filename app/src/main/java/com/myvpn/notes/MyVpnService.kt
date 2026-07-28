@@ -83,43 +83,47 @@ class MyVpnService : VpnService() {
 
             log("🔑 UUID: ${uuid.take(8)}...")
 
-            // Останавливаем старые зомби-процессы
+            // Останавливаем прошлые процессы
             try { LibXray.stopXray() } catch (e: Exception) {}
             Thread.sleep(200)
 
-            // Защита от GeoIP краша (создаем пустые файлы и указываем путь)
+            // 1. Создаем папку и файлы геолокации в рабочей директории
             val assetDir = filesDir.absolutePath
             File(filesDir, "geoip.dat").apply { if (!exists()) createNewFile() }
             File(filesDir, "geosite.dat").apply { if (!exists()) createNewFile() }
-            try {
-                System.setProperty("xray.location.asset", assetDir)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                    android.system.Os.setenv("xray.location.asset", assetDir, true)
-                }
-            } catch (e: Exception) {}
 
-            // ПОИСК СВОБОДНОГО ПОРТА (Защита от ошибки Address already in use)
+            // 2. Находим чистый свободный порт
             var proxyPort = 10808
             while (!isPortAvailable(proxyPort) && proxyPort < 10900) {
                 proxyPort++
             }
-            log("🔍 Выделен чистый порт: $proxyPort")
+            log("🔍 Выделен порт: $proxyPort")
 
-            // ЗАПУСК ЯДРА С ЧИСТЫМ КОНФИГОМ
-            log("⚙️ Запуск ядра...")
-            val rawJson = generateUltraMinimalConfig(uuid, proxyPort)
-            val base64Config = Base64.encodeToString(rawJson.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+            // 3. Сохраняем сам VLESS конфиг в файл config.json
+            val rawConfigJson = generateUltraMinimalConfig(uuid, proxyPort)
+            val configFile = File(filesDir, "config.json")
+            configFile.writeText(rawConfigJson)
 
-            val resultBase64 = LibXray.runXray(base64Config)
+            // 4. Формируем официальный запрос RunXrayRequest для библиотеки libXray
+            val runXrayRequestJson = """
+            {
+              "datDir": "$assetDir",
+              "configPath": "${configFile.absolutePath}"
+            }
+            """.trimIndent()
+
+            log("⚙️ Запуск ядра Xray...")
+            val base64Request = Base64.encodeToString(runXrayRequestJson.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+
+            val resultBase64 = LibXray.runXray(base64Request)
             val resultText = try {
                 String(Base64.decode(resultBase64, Base64.DEFAULT), Charsets.UTF_8)
             } catch (e: Exception) {
                 resultBase64
             }
 
-            log("ℹ️ Статус ядра: $resultText")
+            log("ℹ️ Ответ ядра: $resultText")
 
-            // Если успех - летим дальше
             if (resultText.contains("error", ignoreCase = true) || !resultText.contains("success")) {
                 log("❌ ЯДРО НЕ ЗАПУСТИЛОСЬ!")
                 stopVpnInternal()
@@ -127,11 +131,9 @@ class MyVpnService : VpnService() {
             }
 
             log("✅ Ядро успешно запущено!")
-            
-            // Даем ядру полсекунды, чтобы 100% закрепить порт
             Thread.sleep(500)
 
-            // НАСТРОЙКА TUN ИНТЕРФЕЙСА
+            // 5. НАСТРОЙКА TUN ИНТЕРФЕЙСА
             log("🔌 Подключение TUN кабеля...")
             val builder = Builder()
                 .addAddress("10.0.0.2", 24)
@@ -151,7 +153,7 @@ class MyVpnService : VpnService() {
                 return
             }
 
-            // ЗАПУСК C++ HEV SOCKS5
+            // 6. ЗАПУСК C++ HEV SOCKS5
             val ymlFile = File(filesDir, "socks.yml")
             ymlFile.writeText("tunnel:\n  mtu: 1500\nsocks5:\n  port: $proxyPort\n  address: 127.0.0.1\n  udp: 'udp'\nmisc:\n  task-stack-size: 8192")
 
@@ -186,10 +188,8 @@ class MyVpnService : VpnService() {
 
     private fun generateUltraMinimalConfig(uuid: String, port: Int): String {
         val workerDomain = "dark-poetry-8a03.tio-rex-ultra.workers.dev"
-        val cfIp = "104.26.6.213" 
+        val cfIp = "104.26.6.213"
 
-        // Идеально чистый конфиг, который работал 2 шага назад,
-        // но теперь с динамическим портом (без попыток записи файлов)
         return """
         {
           "log": {
