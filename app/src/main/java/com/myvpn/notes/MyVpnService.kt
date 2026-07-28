@@ -18,6 +18,7 @@ import com.heiher.hev.socks5.tunnel.HevSocks5Tunnel
 import libXray.LibXray
 import java.io.File
 import java.net.InetSocketAddress
+import java.net.ServerSocket
 import java.net.Socket
 import kotlin.concurrent.thread
 
@@ -43,7 +44,7 @@ class MyVpnService : VpnService() {
         val action = intent?.action
 
         if (action == "STOP") {
-            log("🛑 Команда остановки...")
+            log("🛑 Остановка...")
             thread { stopVpnInternal() }
             return START_NOT_STICKY
         }
@@ -71,7 +72,6 @@ class MyVpnService : VpnService() {
         }
 
         thread { startVpnInternal() }
-
         return START_STICKY
     }
 
@@ -87,35 +87,47 @@ class MyVpnService : VpnService() {
 
             // Очистка старых процессов
             try { LibXray.stopXray() } catch (e: Exception) {}
-            Thread.sleep(300)
+            Thread.sleep(200)
 
-            // 1. ЗАПУСК XRAY (ТОЛЬКО SOCKS -> VLESS)
+            // ПОИСК СВОБОДНОГО ПОРТА (ЗАЩИТА ОТ ЗОМБИ-ПРОЦЕССОВ)
+            var proxyPort = 10808
+            while (!isPortAvailable(proxyPort) && proxyPort < 10900) {
+                proxyPort++
+            }
+            log("🔍 Выделен чистый порт: $proxyPort")
+
+            // ПОДГОТОВКА ФАЙЛА ЛОГОВ ЯДРА
+            val logFile = File(filesDir, "xray_core.log")
+            if (logFile.exists()) logFile.delete()
+            logFile.createNewFile()
+
+            // ЗАПУСК ЯДРА
             log("⚙️ Запуск ядра...")
-            val rawJson = generateUltraMinimalConfig(uuid)
+            val rawJson = generateUltraMinimalConfig(uuid, proxyPort, logFile.absolutePath)
             val base64Config = Base64.encodeToString(rawJson.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
 
             val result = LibXray.runXray(base64Config)
-            // Если в ответе есть "error", значит JSON битый
-            if (result.contains("error", ignoreCase = true)) {
-                log("❌ Ошибка конфига!")
-            }
+            if (result.isNotEmpty()) log("ℹ️ Ответ runXray: $result")
 
-            // Ждем порт 10808
+            // ЖДЕМ ПОРТ
             var attempts = 0
-            while (!checkProxyPort(10808) && attempts < 30) {
+            while (!checkProxyPort(proxyPort) && attempts < 25) {
                 Thread.sleep(200)
                 attempts++
             }
 
-            if (!checkProxyPort(10808)) {
-                log("❌ Порт 10808 не открылся!")
+            if (!checkProxyPort(proxyPort)) {
+                // ПОРТ НЕ ОТКРЫЛСЯ - ВЫВОДИМ ИСТИННУЮ ПРИЧИНУ!
+                val errData = if (logFile.exists()) logFile.readText().trim() else "Файл пуст"
+                log("❌ ЯДРО УПАЛО! Причина:")
+                log("📜 $errData")
                 stopVpnInternal()
                 return
             }
 
-            log("✅ Ядро готово!")
+            log("✅ Ядро успешно село на порт $proxyPort!")
 
-            // 2. TUN ИНТЕРФЕЙС
+            // НАСТРОЙКА TUN
             val builder = Builder()
                 .addAddress("10.0.0.2", 24)
                 .addRoute("0.0.0.0", 0)
@@ -129,14 +141,14 @@ class MyVpnService : VpnService() {
             val tunFd = vpnInterface?.fd ?: -1
 
             if (tunFd == -1) {
-                log("❌ Ошибка TUN!")
+                log("❌ Ошибка TUN-интерфейса!")
                 stopVpnInternal()
                 return
             }
 
-            // 3. HEV SOCKS5 TUNNEL
+            // ЗАПУСК HEV SOCKS5
             val ymlFile = File(filesDir, "socks.yml")
-            ymlFile.writeText("tunnel:\n  mtu: 1500\nsocks5:\n  port: 10808\n  address: 127.0.0.1\n  udp: 'udp'\nmisc:\n  task-stack-size: 8192")
+            ymlFile.writeText("tunnel:\n  mtu: 1500\nsocks5:\n  port: $proxyPort\n  address: 127.0.0.1\n  udp: 'udp'\nmisc:\n  task-stack-size: 8192")
 
             isRunning = true
             isHevRunning = true
@@ -145,13 +157,13 @@ class MyVpnService : VpnService() {
                 try {
                     HevSocks5Tunnel.hev_socks5_tunnel_main(ymlFile.absolutePath, tunFd)
                 } catch (e: Throwable) {
-                    log("⚠️ Поток закрыт")
+                    log("⚠️ Сбой потока HEV")
                 } finally {
                     isHevRunning = false
                 }
             }
 
-            log("🎉 СОЕДИНЕНО!")
+            log("🎉 СОЕДИНЕНИЕ УСТАНОВЛЕНО!")
 
         } catch (e: Exception) {
             log("💥 СБОЙ: ${e.message}")
@@ -159,22 +171,33 @@ class MyVpnService : VpnService() {
         }
     }
 
+    private fun isPortAvailable(port: Int): Boolean {
+        return try {
+            ServerSocket(port).use { true }
+        } catch (e: Exception) {
+            false
+        }
+    }
+
     private fun checkProxyPort(port: Int): Boolean {
         return try {
-            Socket().use { it.connect(InetSocketAddress("127.0.0.1", port), 300); true }
+            Socket().use { it.connect(InetSocketAddress("127.0.0.1", port), 200); true }
         } catch (e: Exception) { false }
     }
 
-    // МАКСИМАЛЬНО ЧИСТЫЙ КОНФИГ БЕЗ ФАЙЛОВ GEOIP/GEOSITE
-    private fun generateUltraMinimalConfig(uuid: String): String {
+    private fun generateUltraMinimalConfig(uuid: String, port: Int, logPath: String): String {
         val workerDomain = "dark-poetry-8a03.tio-rex-ultra.workers.dev"
-        val cfIp = "104.26.6.213" // Прямой IP Cloudflare
+        val cfIp = "104.26.6.213" 
 
+        // Идеально чистый конфиг с записью ошибок напрямую в файл
         return """
         {
-          "log": { "loglevel": "warning" },
+          "log": {
+            "loglevel": "debug",
+            "error": "$logPath"
+          },
           "inbounds": [{
-            "port": 10808,
+            "port": $port,
             "listen": "127.0.0.1",
             "protocol": "socks",
             "settings": { "auth": "noauth", "udp": true }
@@ -213,7 +236,7 @@ class MyVpnService : VpnService() {
               "settings": {
                 "fragment": {
                   "packets": "tlshello",
-                  "length": "10-20",
+                  "length": "10-40",
                   "interval": "10-20"
                 }
               }
@@ -230,7 +253,7 @@ class MyVpnService : VpnService() {
         try {
             if (isHevRunning) HevSocks5Tunnel.hev_socks5_tunnel_stop()
             LibXray.stopXray()
-            Thread.sleep(200)
+            Thread.sleep(150)
             vpnInterface?.close()
         } catch (e: Exception) {}
         vpnInterface = null
