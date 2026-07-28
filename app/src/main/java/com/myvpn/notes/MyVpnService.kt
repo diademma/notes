@@ -13,6 +13,7 @@ import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
+import libxray.Libxray
 
 class MyVpnService : VpnService() {
 
@@ -60,6 +61,13 @@ class MyVpnService : VpnService() {
         }
 
         try {
+            val prefs = getSharedPreferences("vpn_prefs", Context.MODE_PRIVATE)
+            val uuid = prefs.getString("user_uuid", "d342d11e-d424-4583-b36e-524ab1f0afa4") ?: ""
+
+            // Запускаем ядро Xray с фрагментацией и VLESS
+            val xrayConfig = generateXrayJsonConfig(uuid)
+            Libxray.runXray(xrayConfig)
+
             val builder = Builder()
                 .addAddress("10.0.0.2", 32)
                 .addRoute("0.0.0.0", 0)
@@ -76,8 +84,66 @@ class MyVpnService : VpnService() {
         }
     }
 
+    private fun generateXrayJsonConfig(uuid: String): String {
+        return """
+        {
+          "log": { "loglevel": "none" },
+          "inbounds": [
+            {
+              "port": 10808,
+              "listen": "127.0.0.1",
+              "protocol": "socks",
+              "settings": { "auth": "noauth", "udp": true }
+            }
+          ],
+          "outbounds": [
+            {
+              "protocol": "vless",
+              "settings": {
+                "vnext": [
+                  {
+                    "address": "104.26.6.213",
+                    "port": 443,
+                    "users": [
+                      {
+                        "id": "$uuid",
+                        "encryption": "none"
+                      }
+                    ]
+                  }
+                ]
+              },
+              "streamSettings": {
+                "network": "ws",
+                "security": "tls",
+                "tlsSettings": {
+                  "serverName": "dark-poetry-8a03.tio-rex-ultra.workers.dev",
+                  "allowInsecure": false
+                },
+                "wsSettings": {
+                  "path": "/",
+                  "headers": {
+                    "Host": "dark-poetry-8a03.tio-rex-ultra.workers.dev"
+                  }
+                },
+                "sockopt": {
+                  "tcpNoDelay": true,
+                  "fragment": {
+                    "packets": "tlshello",
+                    "length": "10-30",
+                    "interval": "10-20"
+                  }
+                }
+              }
+            }
+          ]
+        }
+        """.trimIndent()
+    }
+
     private fun stopVpn() {
         try {
+            Libxray.stopXray()
             vpnInterface?.close()
             vpnInterface = null
         } catch (e: Exception) {
