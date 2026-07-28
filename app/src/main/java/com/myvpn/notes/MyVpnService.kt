@@ -16,8 +16,8 @@ import android.util.Base64
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import libXray.LibXray
-import java.io.File
-import java.io.RandomAccessFile
+import java.io.BufferedReader
+import java.io.InputStreamReader
 import kotlin.concurrent.thread
 
 class MyVpnService : VpnService() {
@@ -74,18 +74,14 @@ class MyVpnService : VpnService() {
 
             log("🔑 Чтение UUID: ${uuid.take(8)}...")
 
-            // 1. Создаем файл для ЖИВЫХ ЛОГОВ!
-            val logFile = File(filesDir, "xray_error.log")
-            if (logFile.exists()) logFile.delete()
-            logFile.createNewFile()
-
-            // 2. БРОНЕБОЙНЫЙ ПЕРЕХВАТ ТРАФИКА
+            // 1. Создаем правильный сетевой интерфейс TUN
             val builder = Builder()
-                .addAddress("10.0.0.2", 32)
+                .addAddress("10.0.0.2", 24)
                 .addAddress("fd00::2", 126)
                 .addRoute("0.0.0.0", 0)
                 .addRoute("::", 0)
-                .addDnsServer("1.1.1.1") // Все запросы полетят на 1.1.1.1 ЧЕРЕЗ ТУННЕЛЬ
+                .addDnsServer("1.1.1.1")
+                .addDnsServer("8.8.8.8")
                 .setMtu(1500)
                 .setSession("Заметки")
                 .addDisallowedApplication(packageName)
@@ -98,19 +94,20 @@ class MyVpnService : VpnService() {
                 log("🔌 TUN кабель #$fd привязан!")
             }
 
-            // 3. ЗАПУСКАЕМ ЖИВОЙ ЧИТАТЕЛЬ ЛОГОВ (ВЕРНУЛ ЕГО НА МЕСТО!)
+            // 2. ЧИТАЕМ СИСТЕМНЫЙ LOGCAT В РЕАЛЬНОМ ВРЕМЕНИ!
             isTunnelActive = true
-            startLiveLogTailer(logFile)
+            startLogcatReader()
 
-            // 4. ЗАПУСКАЕМ XRAY В РЕЖИМЕ DEBUG
-            log("⚙️ Запуск ядра Xray (режим DEBUG)...")
-            val rawJson = generateXrayJsonConfig(uuid, logFile.absolutePath)
+            // 3. ЗАПУСКАЕМ XRAY С СЕТЕВЫМ СТЕКОМ GVISOR
+            log("⚙️ Запуск ядра Xray (стек gVisor)...")
+            val rawJson = generateXrayJsonConfig(uuid)
             val base64Config = Base64.encodeToString(rawJson.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
             
             val result = LibXray.runXray(base64Config)
-            log("🌐 Инициализация Xray: $result")
+            log("🌐 Ответ ядра Xray: $result")
 
             isRunning = true
+            log("🎉 СТЕК GVISOR ВКЛЮЧЕН! Проверяем интернет!")
 
         } catch (e: Exception) {
             log("💥 КРИТИЧЕСКАЯ ОШИБКА: ${e.message}")
@@ -119,40 +116,33 @@ class MyVpnService : VpnService() {
         }
     }
 
-    // 📟 ВОТ ОН - СТРИМЕР ЖИВЫХ ЛОГОВ, ЧТОБЫ МЫ ВИДЕЛИ КАЖДЫЙ ПАКЕТ
-    private fun startLiveLogTailer(logFile: File) {
+    // 📟 ПРЯМОЙ ЧИТАТЕЛЬ LOGCAT ЖУРНАЛА ANDROID
+    private fun startLogcatReader() {
         thread {
             try {
-                var lastPointer = 0L
-                while (isTunnelActive) {
-                    if (logFile.exists() && logFile.length() > lastPointer) {
-                        val raf = RandomAccessFile(logFile, "r")
-                        raf.seek(lastPointer)
-                        var line = raf.readLine()
-                        while (line != null) {
-                            if (line.isNotBlank()) {
-                                // Исправляем кодировку логов
-                                val utf8Line = String(line.toByteArray(Charsets.ISO_8859_1), Charsets.UTF_8)
-                                log("📜 $utf8Line")
-                            }
-                            line = raf.readLine()
-                        }
-                        lastPointer = raf.filePointer
-                        raf.close()
+                // Очищаем прошлый логcat
+                Runtime.getRuntime().exec("logcat -c")
+                
+                val process = Runtime.getRuntime().exec("logcat -v time")
+                val reader = BufferedReader(InputStreamReader(process.inputStream))
+                var line: String? = reader.readLine()
+                
+                while (isTunnelActive && line != null) {
+                    if (line.contains("Xray") || line.contains("libXray") || line.contains("app/proxy")) {
+                        log("📜 $line")
                     }
-                    Thread.sleep(300)
+                    line = reader.readLine()
                 }
             } catch (e: Exception) {}
         }
     }
 
-    // 🛠 ТУПАЯ И НАДЕЖНАЯ МАРШРУТИЗАЦИЯ (Всё в Воркер!)
-    private fun generateXrayJsonConfig(uuid: String, logPath: String): String {
+    // 🛠 КОНФИГУРАЦИЯ С ОБОЗНАЧЕНИЕМ "stack": "gvisor"
+    private fun generateXrayJsonConfig(uuid: String): String {
         return """
         {
           "log": {
-            "loglevel": "debug",
-            "error": "$logPath"
+            "loglevel": "debug"
           },
           "inbounds": [
             {
@@ -160,7 +150,7 @@ class MyVpnService : VpnService() {
               "protocol": "tun",
               "settings": {
                 "mtu": 1500,
-                "autoProxy": true
+                "stack": "gvisor"
               },
               "sniffing": {
                 "enabled": true,
