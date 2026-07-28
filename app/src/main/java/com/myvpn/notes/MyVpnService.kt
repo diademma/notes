@@ -3,6 +3,7 @@ package com.myvpn.notes
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.bluetooth.BluetoothManager
 import android.content.Context
 import android.content.Intent
@@ -100,11 +101,35 @@ class MyVpnService : VpnService() {
     }
 
     private fun createNotification(): Notification {
+        val stopIntent = Intent(this, MyVpnService::class.java).apply {
+            action = "STOP"
+        }
+        val pendingStopIntent = PendingIntent.getService(
+            this,
+            0,
+            stopIntent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        val openAppIntent = Intent(this, MainActivity::class.java)
+        val pendingOpenIntent = PendingIntent.getActivity(
+            this,
+            0,
+            openAppIntent,
+            PendingIntent.FLAG_IMMUTABLE
+        )
+
         return NotificationCompat.Builder(this, "vpn_channel")
             .setContentTitle("Заметки")
             .setContentText("Защищенный режим активен")
             .setSmallIcon(android.R.drawable.ic_menu_edit)
+            .setContentIntent(pendingOpenIntent)
             .setOngoing(true)
+            .addAction(
+                android.R.drawable.ic_menu_close_clear_cancel,
+                "Отключиться",
+                pendingStopIntent
+            )
             .build()
     }
 
