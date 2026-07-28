@@ -87,24 +87,24 @@ class MyVpnService : VpnService() {
             try { LibXray.stopXray() } catch (e: Exception) {}
             Thread.sleep(200)
 
-            // 1. Создаем папку и файлы геолокации в рабочей директории
+            // 1. Создаем рабочие файлы
             val assetDir = filesDir.absolutePath
             File(filesDir, "geoip.dat").apply { if (!exists()) createNewFile() }
             File(filesDir, "geosite.dat").apply { if (!exists()) createNewFile() }
 
-            // 2. Находим чистый свободный порт
+            // 2. Находим свободный порт
             var proxyPort = 10808
             while (!isPortAvailable(proxyPort) && proxyPort < 10900) {
                 proxyPort++
             }
             log("🔍 Выделен порт: $proxyPort")
 
-            // 3. Сохраняем сам VLESS конфиг в файл config.json
+            // 3. Сохраняем VLESS конфиг в config.json
             val rawConfigJson = generateUltraMinimalConfig(uuid, proxyPort)
             val configFile = File(filesDir, "config.json")
             configFile.writeText(rawConfigJson)
 
-            // 4. Формируем официальный запрос RunXrayRequest для библиотеки libXray
+            // 4. Формируем запрос RunXrayRequest для libXray
             val runXrayRequestJson = """
             {
               "datDir": "$assetDir",
@@ -148,7 +148,7 @@ class MyVpnService : VpnService() {
             val tunFd = vpnInterface?.fd ?: -1
 
             if (tunFd == -1) {
-                log("❌ Ошибка создания TUN-интерфейса!")
+                log("❌ Ошибка TUN-интерфейса!")
                 stopVpnInternal()
                 return
             }
