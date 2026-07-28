@@ -11,9 +11,10 @@ import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.util.Base64
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
-import libxray.Libxray
+import libXray.LibXray
 
 class MyVpnService : VpnService() {
 
@@ -64,9 +65,10 @@ class MyVpnService : VpnService() {
             val prefs = getSharedPreferences("vpn_prefs", Context.MODE_PRIVATE)
             val uuid = prefs.getString("user_uuid", "d342d11e-d424-4583-b36e-524ab1f0afa4") ?: ""
 
-            // Запускаем ядро Xray с фрагментацией и VLESS
-            val xrayConfig = generateXrayJsonConfig(uuid)
-            Libxray.runXray(xrayConfig)
+            // Запускаем ядро Xray с Base64 VLESS-конфигом
+            val rawJson = generateXrayJsonConfig(uuid)
+            val base64Config = Base64.encodeToString(rawJson.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+            LibXray.runXray(base64Config)
 
             val builder = Builder()
                 .addAddress("10.0.0.2", 32)
@@ -143,7 +145,7 @@ class MyVpnService : VpnService() {
 
     private fun stopVpn() {
         try {
-            Libxray.stopXray()
+            LibXray.stopXray()
             vpnInterface?.close()
             vpnInterface = null
         } catch (e: Exception) {
