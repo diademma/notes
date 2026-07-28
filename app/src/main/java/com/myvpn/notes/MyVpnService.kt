@@ -11,10 +11,14 @@ import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.system.Os
+import android.util.Base64
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
-import io.nec.sopy.singbox.BoxService
-import io.nec.sopy.singbox.CommandServer
+import libXray.LibXray
+import java.io.File
+import java.io.RandomAccessFile
+import kotlin.concurrent.thread
 
 class MyVpnService : VpnService() {
 
@@ -28,6 +32,7 @@ class MyVpnService : VpnService() {
     }
 
     private var vpnInterface: ParcelFileDescriptor? = null
+    private var isTunnelActive = false
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val action = intent?.action
@@ -69,32 +74,53 @@ class MyVpnService : VpnService() {
 
             log("🔑 Чтение UUID: ${uuid.take(8)}...")
 
-            // 1. Создаем сетевой интерфейс
+            // 1. Создаем файл логов внутри папки приложения
+            val logFile = File(filesDir, "xray_error.log")
+            if (logFile.exists()) logFile.delete()
+            logFile.createNewFile()
+
+            // 2. Создаем интерфейс TUN
             val builder = Builder()
-                .addAddress("172.19.0.1", 30)
-                .addAddress("fdfe:dcba:9876::1", 126)
+                .addAddress("10.0.0.2", 24)
+                .addAddress("fd00::2", 126)
                 .addRoute("0.0.0.0", 0)
                 .addRoute("::", 0)
                 .addDnsServer("1.1.1.1")
+                .addDnsServer("8.8.8.8")
                 .setMtu(1500)
                 .setSession("Заметки")
                 .addDisallowedApplication(packageName)
 
             vpnInterface = builder.establish()
 
-            // 2. Запускаем ультралегкий движок Sing-Box
-            log("⚙️ Запуск легкого C++ ядра Sing-Box...")
-            val configJson = generateSingBoxJsonConfig(uuid)
-            
-            // Старт высокоскоростного туннеля
-            val pfd = vpnInterface
-            if (pfd != null) {
-                BoxService.start(configJson, pfd.fd)
-                log("🔌 Стек LWIP запущен! Подключение к 104.26.6.213...")
+            var tunFd = -1
+            vpnInterface?.let { pfd ->
+                tunFd = pfd.fd
+                // Передаем переменные кабеля ДО старта Xray
+                Os.setenv("xray.tun.fd", tunFd.toString(), true)
+                Os.setenv("XRAY_TUN_FD", tunFd.toString(), true)
+                log("🔌 TUN кабель #$tunFd привязан к системе!")
             }
 
+            if (tunFd == -1) {
+                log("❌ Ошибка привязки кабеля!")
+                stopVpn()
+                return
+            }
+
+            // 3. Запускаем читатель файла логов
+            isTunnelActive = true
+            startFileLogTailer(logFile)
+
+            // 4. Запускаем Xray с логированием в файл
+            log("⚙️ Запуск ядра Xray...")
+            val rawJson = generateXrayJsonConfig(uuid, logFile.absolutePath)
+            val base64Config = Base64.encodeToString(rawJson.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+            
+            val result = LibXray.runXray(base64Config)
+            log("🌐 Ответ ядра Xray: $result")
+
             isRunning = true
-            log("🎉 ГОТОВО! 6-Мегабайтный десант готов к работе!")
 
         } catch (e: Exception) {
             log("💥 КРИТИЧЕСКАЯ ОШИБКА: ${e.message}")
@@ -103,57 +129,114 @@ class MyVpnService : VpnService() {
         }
     }
 
-    private fun generateSingBoxJsonConfig(uuid: String): String {
+    // 📟 ЧИТАТЕЛЬ ФАЙЛА ЛОГОВ ИЗ ПАМЯТИ ПРИЛОЖЕНИЯ (Работает 100% на Android 14)
+    private fun startFileLogTailer(logFile: File) {
+        thread {
+            try {
+                var lastPointer = 0L
+                while (isTunnelActive) {
+                    if (logFile.exists() && logFile.length() > lastPointer) {
+                        val raf = RandomAccessFile(logFile, "r")
+                        raf.seek(lastPointer)
+                        var line = raf.readLine()
+                        while (line != null) {
+                            if (line.isNotBlank()) {
+                                log("📜 $line")
+                            }
+                            line = raf.readLine()
+                        }
+                        lastPointer = raf.filePointer
+                        raf.close()
+                    }
+                    Thread.sleep(300)
+                }
+            } catch (e: Exception) {}
+        }
+    }
+
+    // 🛠 ЧИСТЫЙ ВАЛИДНЫЙ JSON XRAY
+    private fun generateXrayJsonConfig(uuid: String, logPath: String): String {
         return """
         {
-          "log": { "level": "panic" },
+          "log": {
+            "loglevel": "debug",
+            "error": "$logPath"
+          },
           "inbounds": [
             {
-              "type": "tun",
               "tag": "tun-in",
-              "inet4_address": "172.19.0.1/30",
-              "inet6_address": "fdfe:dcba:9876::1/126",
-              "mtu": 1500,
-              "auto_route": true,
-              "strict_route": true,
-              "stack": "lwip",
-              "sniff": true
+              "protocol": "tun",
+              "settings": {
+                "mtu": 1500,
+                "stack": "gvisor"
+              },
+              "sniffing": {
+                "enabled": true,
+                "destOverride": ["http", "tls", "quic"]
+              }
             }
           ],
           "outbounds": [
             {
-              "type": "vless",
               "tag": "proxy",
-              "server": "104.26.6.213",
-              "server_port": 443,
-              "uuid": "$uuid",
-              "transport": {
-                "type": "ws",
-                "path": "/",
-                "headers": {
-                  "Host": "dark-poetry-8a03.tio-rex-ultra.workers.dev"
-                }
+              "protocol": "vless",
+              "settings": {
+                "vnext": [
+                  {
+                    "address": "104.26.6.213",
+                    "port": 443,
+                    "users": [
+                      {
+                        "id": "$uuid",
+                        "encryption": "none"
+                      }
+                    ]
+                  }
+                ]
               },
-              "tls": {
-                "enabled": true,
-                "server_name": "dark-poetry-8a03.tio-rex-ultra.workers.dev",
-                "insecure": false,
-                "fragment": {
-                  "enabled": true,
-                  "size": "10-30",
-                  "sleep": "10-20"
+              "streamSettings": {
+                "network": "ws",
+                "security": "tls",
+                "tlsSettings": {
+                  "serverName": "dark-poetry-8a03.tio-rex-ultra.workers.dev",
+                  "allowInsecure": false
+                },
+                "wsSettings": {
+                  "path": "/",
+                  "headers": {
+                    "Host": "dark-poetry-8a03.tio-rex-ultra.workers.dev"
+                  }
+                },
+                "sockopt": {
+                  "tcpNoDelay": true,
+                  "fragment": {
+                    "packets": "tlshello",
+                    "length": "10-30",
+                    "interval": "10-20"
+                  }
                 }
               }
             }
-          ]
+          ],
+          "routing": {
+            "domainStrategy": "AsIs",
+            "rules": [
+              {
+                "type": "field",
+                "inboundTag": ["tun-in"],
+                "outboundTag": "proxy"
+              }
+            ]
+          }
         }
         """.trimIndent()
     }
 
     private fun stopVpn() {
+        isTunnelActive = false
         try {
-            log("🛑 Остановка ядра...")
-            BoxService.stop()
+            log("🛑 Остановка ядра Xray...")
+            LibXray.stopXray()
             vpnInterface?.close()
             vpnInterface = null
         } catch (e: Exception) {}
