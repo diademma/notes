@@ -8,7 +8,6 @@ import android.bluetooth.BluetoothManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
-import android.net.ProxyInfo
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -17,8 +16,8 @@ import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import libXray.LibXray
 import java.io.File
-import java.net.InetSocketAddress
-import java.net.Socket
+import java.io.RandomAccessFile
+import kotlin.concurrent.thread
 
 class MyVpnService : VpnService() {
 
@@ -32,6 +31,7 @@ class MyVpnService : VpnService() {
     }
 
     private var vpnInterface: ParcelFileDescriptor? = null
+    private var isTunnelActive = false
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val action = intent?.action
@@ -73,90 +73,130 @@ class MyVpnService : VpnService() {
 
             log("🔑 Чтение UUID: ${uuid.take(8)}...")
 
-            // 1. СОЗДАЕМ ФИЗИЧЕСКИЙ ФАЙЛ CONFIG.JSON НА ДИСКЕ ПЛАНШЕТА
-            val configFile = File(filesDir, "config.json")
-            if (configFile.exists()) configFile.delete()
-            
-            val rawJson = generateXrayJsonConfig(uuid)
-            configFile.writeText(rawJson)
-            log("📄 Файл конфигурации создан: ${configFile.name}")
+            // 1. Файл логов
+            val logFile = File(filesDir, "xray_error.log")
+            if (logFile.exists()) logFile.delete()
+            logFile.createNewFile()
 
-            // 2. ЗАПУСКАЕМ XRAY ЧЕРЕЗ ПУТЬ К ФАЙЛУ
-            log("⚙️ Запуск ядра Xray на порту 20809...")
-            val base64Config = Base64.encodeToString(rawJson.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
-
-            val result = try {
-                LibXray.runXray(base64Config)
-            } catch (e: Exception) {
-                "Error: ${e.message}"
-            }
-            log("🌐 Ответ Xray: $result")
-
-            // Даем время на открытие порта 20809
-            Thread.sleep(600)
-            val isPortReady = checkProxyPort(20809)
-
-            if (isPortReady) {
-                log("✅ УСПЕХ! Порт 127.0.0.1:20809 ФИЗИЧЕСКИ ОТКРЫТ!")
-            } else {
-                log("⚠️ Ошибка: порт 20809 не ответил! Пробуем альтернативный запуск...")
-            }
-
-            // 3. ПРИВЯЗЫВАЕМ ANDROID К ОТКРЫТОМУ ПОРТУ
+            // 2. Создаем сетевой интерфейс TUN
             val builder = Builder()
-                .addAddress("10.0.0.2", 32)
+                .addAddress("10.0.0.2", 24)
+                .addAddress("fd00::2", 126)
                 .addRoute("0.0.0.0", 0)
+                .addRoute("::", 0)
+                .addDnsServer("1.1.1.1")
+                .addDnsServer("8.8.8.8")
+                .setMtu(1500)
                 .setSession("Заметки")
                 .addDisallowedApplication(packageName)
 
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                builder.setHttpProxy(ProxyInfo.buildDirectProxy("127.0.0.1", 20809))
-                log("🔌 Системный трафик привязан к 127.0.0.1:20809")
-            }
-
             vpnInterface = builder.establish()
 
+            var tunFd = -1
+            vpnInterface?.let { pfd ->
+                tunFd = pfd.fd
+                log("🔌 TUN кабель #$tunFd получен!")
+            }
+
+            if (tunFd == -1) {
+                log("❌ Не удалось получить кабель TUN!")
+                stopVpn()
+                return
+            }
+
+            // 3. Создаем физический файл config.json
+            val configFile = File(filesDir, "config.json")
+            if (configFile.exists()) configFile.delete()
+            val rawXrayJson = generateXrayJsonConfig(uuid, logFile.absolutePath, tunFd)
+            configFile.writeText(rawXrayJson)
+
+            // 4. Запускаем живой читатель логов
+            isTunnelActive = true
+            startFileLogTailer(logFile)
+
+            // 5. ФОРМИРУЕМ ПРАВИЛЬНЫЙ ЗАПРОС RunXrayRequest С ПУТЕМ К ФАЙЛУ!
+            log("⚙️ Отправляем запрос на запуск Xray...")
+            val runRequestJson = """
+            {
+              "datDir": "${filesDir.absolutePath}",
+              "configPath": "${configFile.absolutePath}"
+            }
+            """.trimIndent()
+
+            val base64Request = Base64.encodeToString(runRequestJson.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+            
+            // Вызываем Xray и РАСШИФРОВЫВАЕМ его Base64-ответ!
+            val rawResponse = LibXray.runXray(base64Request)
+            val decodedResponse = try {
+                String(Base64.decode(rawResponse, Base64.DEFAULT), Charsets.UTF_8)
+            } catch (e: Exception) {
+                rawResponse
+            }
+
+            log("🌐 Ответ Xray: $decodedResponse")
+
             isRunning = true
-            log("🎉 СИСТЕМА ГОТОВА! Открывай сайты!")
+            log("🎉 ГОТОВО! Кабель #$tunFd успешно задействован!")
 
         } catch (e: Exception) {
-            log("💥 ОШИБКА: ${e.message}")
+            log("💥 КРИТИЧЕСКАЯ ОШИБКА: ${e.message}")
             e.printStackTrace()
             stopVpn()
         }
     }
 
-    private fun checkProxyPort(port: Int): Boolean {
-        return try {
-            val socket = Socket()
-            socket.connect(InetSocketAddress("127.0.0.1", port), 500)
-            socket.close()
-            true
-        } catch (e: Exception) {
-            false
+    private fun startFileLogTailer(logFile: File) {
+        thread {
+            try {
+                var lastPointer = 0L
+                while (isTunnelActive) {
+                    if (logFile.exists() && logFile.length() > lastPointer) {
+                        val raf = RandomAccessFile(logFile, "r")
+                        raf.seek(lastPointer)
+                        var line = raf.readLine()
+                        while (line != null) {
+                            if (line.isNotBlank()) {
+                                log("📜 $line")
+                            }
+                            line = raf.readLine()
+                        }
+                        lastPointer = raf.filePointer
+                        raf.close()
+                    }
+                    Thread.sleep(300)
+                }
+            } catch (e: Exception) {}
         }
     }
 
-    private fun generateXrayJsonConfig(uuid: String): String {
+    // 🛠 ИДЕАЛЬНЫЙ JSON CONFIG С ПРИВЯЗКОЙ КАБЕЛЯ ЧЕРЕЗ "env"
+    private fun generateXrayJsonConfig(uuid: String, logPath: String, tunFd: Int): String {
         return """
         {
+          "env": {
+            "xray.tun.fd": "$tunFd"
+          },
           "log": {
-            "loglevel": "warning"
+            "loglevel": "debug",
+            "error": "$logPath"
           },
           "inbounds": [
             {
-              "port": 20809,
-              "listen": "127.0.0.1",
-              "protocol": "http"
-            },
-            {
-              "port": 20808,
-              "listen": "127.0.0.1",
-              "protocol": "socks"
+              "tag": "tun-in",
+              "protocol": "tun",
+              "settings": {
+                "mtu": 1500,
+                "stack": "gvisor"
+              },
+              "sniffing": {
+                "enabled": true,
+                "destOverride": ["http", "tls", "quic"]
+              }
             }
           ],
           "outbounds": [
             {
+              "tag": "proxy",
               "protocol": "vless",
               "settings": {
                 "vnext": [
@@ -195,14 +235,25 @@ class MyVpnService : VpnService() {
                 }
               }
             }
-          ]
+          ],
+          "routing": {
+            "domainStrategy": "AsIs",
+            "rules": [
+              {
+                "type": "field",
+                "inboundTag": ["tun-in"],
+                "outboundTag": "proxy"
+              }
+            ]
+          }
         }
         """.trimIndent()
     }
 
     private fun stopVpn() {
+        isTunnelActive = false
         try {
-            log("🛑 Остановка...")
+            log("🛑 Остановка ядра Xray...")
             LibXray.stopXray()
             vpnInterface?.close()
             vpnInterface = null
@@ -210,7 +261,7 @@ class MyVpnService : VpnService() {
         isRunning = false
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
-        log("👋 Отключено.")
+        log("👋 Защищенный режим отключен.")
     }
 
     private fun createNotificationChannel() {
