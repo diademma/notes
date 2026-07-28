@@ -15,8 +15,8 @@ import android.util.Base64
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import libXray.LibXray
+import com.heiher.hev.socks5.tunnel.HevSocks5Tunnel
 import java.io.File
-import java.io.RandomAccessFile
 import kotlin.concurrent.thread
 
 class MyVpnService : VpnService() {
@@ -31,7 +31,6 @@ class MyVpnService : VpnService() {
     }
 
     private var vpnInterface: ParcelFileDescriptor? = null
-    private var isTunnelActive = false
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val action = intent?.action
@@ -73,19 +72,18 @@ class MyVpnService : VpnService() {
 
             log("🔑 Чтение UUID: ${uuid.take(8)}...")
 
-            // 1. Файл логов
-            val logFile = File(filesDir, "xray_error.log")
-            if (logFile.exists()) logFile.delete()
-            logFile.createNewFile()
+            // 1. ЗАПУСКАЕМ XRAY НА ПОРТУ 10808 (SOCKS5)
+            log("⚙️ Запуск ядра Xray...")
+            val rawJson = generateXrayJsonConfig(uuid)
+            val base64Config = Base64.encodeToString(rawJson.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+            
+            LibXray.runXray(base64Config)
 
-            // 2. Создаем сетевой интерфейс TUN
+            // 2. СОЗДАЕМ СЕТЕВОЙ ИНТЕРФЕЙС TUN
             val builder = Builder()
                 .addAddress("10.0.0.2", 24)
-                .addAddress("fd00::2", 126)
                 .addRoute("0.0.0.0", 0)
-                .addRoute("::", 0)
                 .addDnsServer("1.1.1.1")
-                .addDnsServer("8.8.8.8")
                 .setMtu(1500)
                 .setSession("Заметки")
                 .addDisallowedApplication(packageName)
@@ -95,108 +93,72 @@ class MyVpnService : VpnService() {
             var tunFd = -1
             vpnInterface?.let { pfd ->
                 tunFd = pfd.fd
-                log("🔌 TUN кабель #$tunFd получен!")
             }
 
             if (tunFd == -1) {
-                log("❌ Не удалось получить кабель TUN!")
+                log("❌ Сбой получения кабеля!")
                 stopVpn()
                 return
             }
 
-            // 3. Создаем физический файл config.json
-            val configFile = File(filesDir, "config.json")
-            if (configFile.exists()) configFile.delete()
-            val rawXrayJson = generateXrayJsonConfig(uuid, logFile.absolutePath, tunFd)
-            configFile.writeText(rawXrayJson)
+            // 3. СОЗДАЕМ КОНФИГ ДЛЯ C++ МОДУЛЯ HEV-SOCKS5
+            val ymlFile = File(filesDir, "socks.yml")
+            if (ymlFile.exists()) ymlFile.delete()
+            ymlFile.writeText(generateHevConfig())
 
-            // 4. Запускаем живой читатель логов
-            isTunnelActive = true
-            startFileLogTailer(logFile)
-
-            // 5. ФОРМИРУЕМ ПРАВИЛЬНЫЙ ЗАПРОС RunXrayRequest С ПУТЕМ К ФАЙЛУ!
-            log("⚙️ Отправляем запрос на запуск Xray...")
-            val runRequestJson = """
-            {
-              "datDir": "${filesDir.absolutePath}",
-              "configPath": "${configFile.absolutePath}"
+            // 4. ЗАПУСКАЕМ C++ МОДУЛЬ ТУННЕЛИРОВАНИЯ
+            log("🔌 Запуск C++ двигателя (hev-socks5)...")
+            thread {
+                try {
+                    HevSocks5Tunnel.hev_socks5_tunnel_main(ymlFile.absolutePath, tunFd)
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
             }
-            """.trimIndent()
-
-            val base64Request = Base64.encodeToString(runRequestJson.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
-            
-            // Вызываем Xray и РАСШИФРОВЫВАЕМ его Base64-ответ!
-            val rawResponse = LibXray.runXray(base64Request)
-            val decodedResponse = try {
-                String(Base64.decode(rawResponse, Base64.DEFAULT), Charsets.UTF_8)
-            } catch (e: Exception) {
-                rawResponse
-            }
-
-            log("🌐 Ответ Xray: $decodedResponse")
 
             isRunning = true
-            log("🎉 ГОТОВО! Кабель #$tunFd успешно задействован!")
+            log("🎉 АБСОЛЮТНАЯ ПОБЕДА! C++ Двигатель запущен!")
 
         } catch (e: Exception) {
-            log("💥 КРИТИЧЕСКАЯ ОШИБКА: ${e.message}")
+            log("💥 ОШИБКА: ${e.message}")
             e.printStackTrace()
             stopVpn()
         }
     }
 
-    private fun startFileLogTailer(logFile: File) {
-        thread {
-            try {
-                var lastPointer = 0L
-                while (isTunnelActive) {
-                    if (logFile.exists() && logFile.length() > lastPointer) {
-                        val raf = RandomAccessFile(logFile, "r")
-                        raf.seek(lastPointer)
-                        var line = raf.readLine()
-                        while (line != null) {
-                            if (line.isNotBlank()) {
-                                log("📜 $line")
-                            }
-                            line = raf.readLine()
-                        }
-                        lastPointer = raf.filePointer
-                        raf.close()
-                    }
-                    Thread.sleep(300)
-                }
-            } catch (e: Exception) {}
-        }
+    private fun generateHevConfig(): String {
+        return """
+        tunnel:
+          mtu: 1500
+
+        socks5:
+          port: 10808
+          address: 127.0.0.1
+
+        misc:
+          task-stack-size: 8192
+        """.trimIndent()
     }
 
-    // 🛠 ИДЕАЛЬНЫЙ JSON CONFIG С ПРИВЯЗКОЙ КАБЕЛЯ ЧЕРЕЗ "env"
-    private fun generateXrayJsonConfig(uuid: String, logPath: String, tunFd: Int): String {
+    private fun generateXrayJsonConfig(uuid: String): String {
         return """
         {
-          "env": {
-            "xray.tun.fd": "$tunFd"
-          },
           "log": {
-            "loglevel": "debug",
-            "error": "$logPath"
+            "loglevel": "warning"
           },
           "inbounds": [
             {
-              "tag": "tun-in",
-              "protocol": "tun",
+              "port": 10808,
+              "listen": "127.0.0.1",
+              "protocol": "socks",
               "settings": {
-                "mtu": 1500,
-                "stack": "gvisor"
-              },
-              "sniffing": {
-                "enabled": true,
-                "destOverride": ["http", "tls", "quic"]
+                "auth": "noauth",
+                "udp": true
               }
             }
           ],
           "outbounds": [
             {
-              "tag": "proxy",
               "protocol": "vless",
               "settings": {
                 "vnext": [
@@ -235,25 +197,15 @@ class MyVpnService : VpnService() {
                 }
               }
             }
-          ],
-          "routing": {
-            "domainStrategy": "AsIs",
-            "rules": [
-              {
-                "type": "field",
-                "inboundTag": ["tun-in"],
-                "outboundTag": "proxy"
-              }
-            ]
-          }
+          ]
         }
         """.trimIndent()
     }
 
     private fun stopVpn() {
-        isTunnelActive = false
         try {
-            log("🛑 Остановка ядра Xray...")
+            log("🛑 Остановка...")
+            HevSocks5Tunnel.hev_socks5_tunnel_stop()
             LibXray.stopXray()
             vpnInterface?.close()
             vpnInterface = null
@@ -261,7 +213,7 @@ class MyVpnService : VpnService() {
         isRunning = false
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
-        log("👋 Защищенный режим отключен.")
+        log("👋 Отключено.")
     }
 
     private fun createNotificationChannel() {
