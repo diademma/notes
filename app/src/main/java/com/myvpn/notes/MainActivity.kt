@@ -4,9 +4,12 @@ import android.app.Activity
 import android.bluetooth.BluetoothManager
 import android.content.Context
 import android.content.Intent
+import android.graphics.Color
+import android.graphics.drawable.GradientDrawable
 import android.net.VpnService
 import android.os.Bundle
 import android.view.Gravity
+import android.view.View
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
@@ -23,23 +26,28 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Минималистичная верстка без единого xml-файла!
+        // Глубокий OLED Чёрный фон
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
+            setBackgroundColor(Color.BLACK)
             setPadding(60, 60, 60, 60)
         }
 
         val titleText = TextView(this).apply {
             text = "Заметки"
             textSize = 28f
+            setTextColor(Color.WHITE)
             gravity = Gravity.CENTER
             setPadding(0, 0, 0, 40)
         }
 
         uuidInput = EditText(this).apply {
-            hint = "Введите ваш личный ID"
+            hint = "Введите личный ID"
+            setHintTextColor(Color.GRAY)
+            setTextColor(Color.WHITE)
             textSize = 14f
+            gravity = Gravity.CENTER
             val prefs = getSharedPreferences("vpn_prefs", Context.MODE_PRIVATE)
             setText(prefs.getString("user_uuid", "d342d11e-d424-4583-b36e-524ab1f0afa4"))
         }
@@ -47,13 +55,27 @@ class MainActivity : AppCompatActivity() {
         statusText = TextView(this).apply {
             text = if (MyVpnService.isRunning) "Статус: Защищено" else "Статус: Отключено"
             textSize = 16f
+            setTextColor(if (MyVpnService.isRunning) Color.GREEN else Color.GRAY)
             gravity = Gravity.CENTER
-            setPadding(0, 40, 0, 40)
+            setPadding(0, 40, 0, 50)
         }
 
+        // Круглая стильная кнопка
         btnToggle = Button(this).apply {
-            text = if (MyVpnService.isRunning) "ОСТАНОВИТЬ" else "ПОДКЛЮЧИТЬСЯ"
-            textSize = 18f
+            text = if (MyVpnService.isRunning) "ВКЛ" else "ВЫКЛ"
+            textSize = 20f
+            setTextColor(Color.WHITE)
+            
+            val shape = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(if (MyVpnService.isRunning) Color.parseColor("#4CAF50") else Color.parseColor("#333333"))
+            }
+            background = shape
+
+            layoutParams = LinearLayout.LayoutParams(280, 280).apply {
+                gravity = Gravity.CENTER
+            }
+
             setOnClickListener {
                 handleVpnToggle()
             }
@@ -67,8 +89,13 @@ class MainActivity : AppCompatActivity() {
         setContentView(layout)
     }
 
-    private fun handleVpnToggle() {
-        // 🛡️ СЕКРЕТНАЯ ЗАЩИТА ОТ ДЕТЕЙ: Проверка Bluetooth
+    override fun onResume() {
+        super.onResume()
+        checkBluetoothOrExit()
+    }
+
+    // 🛡️ МОМЕНТАЛЬНЫЙ ВЫЛЕТ ЕЩЕ ДО ОТКРЫТИЯ ЭКРАНА, ЕСЛИ НЕТ БЛЮТУЗА
+    private fun checkBluetoothOrExit() {
         val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
         val bluetoothAdapter = bluetoothManager?.adapter
 
@@ -78,11 +105,11 @@ class MainActivity : AppCompatActivity() {
                 "Ошибка приложения: сбой инициализации модуля (Code: 0x80004005)",
                 Toast.LENGTH_LONG
             ).show()
-            finishAffinity() // Закрываем приложение
-            return
+            finishAffinity() // Моментально закрываем окно
         }
+    }
 
-        // Если Bluetooth включен — сохраняем UUID и запускаем VPN
+    private fun handleVpnToggle() {
         val uuid = uuidInput.text.toString().trim()
         if (uuid.isEmpty()) {
             Toast.makeText(this, "Введите ваш ID!", Toast.LENGTH_SHORT).show()
@@ -123,6 +150,13 @@ class MainActivity : AppCompatActivity() {
 
     private fun updateUI(running: Boolean) {
         statusText.text = if (running) "Статус: Защищено" else "Статус: Отключено"
-        btnToggle.text = if (running) "ОСТАНОВИТЬ" else "ПОДКЛЮЧИТЬСЯ"
+        statusText.setTextColor(if (running) Color.GREEN else Color.GRAY)
+        btnToggle.text = if (running) "ВКЛ" else "ВЫКЛ"
+        
+        val shape = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(if (running) Color.parseColor("#4CAF50") else Color.parseColor("#333333"))
+        }
+        btnToggle.background = shape
     }
 }
