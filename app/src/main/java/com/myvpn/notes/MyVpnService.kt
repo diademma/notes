@@ -17,6 +17,7 @@ import androidx.core.app.NotificationCompat
 import com.heiher.hev.socks5.tunnel.HevSocks5Tunnel
 import libXray.LibXray
 import java.io.File
+import java.net.ServerSocket
 import kotlin.concurrent.thread
 
 class MyVpnService : VpnService() {
@@ -82,19 +83,34 @@ class MyVpnService : VpnService() {
 
             log("🔑 UUID: ${uuid.take(8)}...")
 
-            // Очистка старых процессов
+            // Останавливаем старые зомби-процессы
             try { LibXray.stopXray() } catch (e: Exception) {}
-            Thread.sleep(300)
+            Thread.sleep(200)
 
-            // ЗАПУСК ЯДРА XRAY
+            // Защита от GeoIP краша (создаем пустые файлы и указываем путь)
+            val assetDir = filesDir.absolutePath
+            File(filesDir, "geoip.dat").apply { if (!exists()) createNewFile() }
+            File(filesDir, "geosite.dat").apply { if (!exists()) createNewFile() }
+            try {
+                System.setProperty("xray.location.asset", assetDir)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                    android.system.Os.setenv("xray.location.asset", assetDir, true)
+                }
+            } catch (e: Exception) {}
+
+            // ПОИСК СВОБОДНОГО ПОРТА (Защита от ошибки Address already in use)
+            var proxyPort = 10808
+            while (!isPortAvailable(proxyPort) && proxyPort < 10900) {
+                proxyPort++
+            }
+            log("🔍 Выделен чистый порт: $proxyPort")
+
+            // ЗАПУСК ЯДРА С ЧИСТЫМ КОНФИГОМ
             log("⚙️ Запуск ядра...")
-            val rawJson = generateUltraMinimalConfig(uuid)
+            val rawJson = generateUltraMinimalConfig(uuid, proxyPort)
             val base64Config = Base64.encodeToString(rawJson.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
 
-            // Получаем ответ (обычно он в Base64)
             val resultBase64 = LibXray.runXray(base64Config)
-            
-            // Расшифровываем ответ ядра для терминала!
             val resultText = try {
                 String(Base64.decode(resultBase64, Base64.DEFAULT), Charsets.UTF_8)
             } catch (e: Exception) {
@@ -103,16 +119,16 @@ class MyVpnService : VpnService() {
 
             log("ℹ️ Статус ядра: $resultText")
 
-            // Если ядро вернуло ошибку или не содержит success
+            // Если успех - летим дальше
             if (resultText.contains("error", ignoreCase = true) || !resultText.contains("success")) {
-                log("❌ ЯДРО ВЫДАЛО ОШИБКУ! Отмена.")
+                log("❌ ЯДРО НЕ ЗАПУСТИЛОСЬ!")
                 stopVpnInternal()
                 return
             }
 
             log("✅ Ядро успешно запущено!")
             
-            // Даем ядру полсекунды, чтобы 100% поднять слушатель порта 10808
+            // Даем ядру полсекунды, чтобы 100% закрепить порт
             Thread.sleep(500)
 
             // НАСТРОЙКА TUN ИНТЕРФЕЙСА
@@ -135,9 +151,9 @@ class MyVpnService : VpnService() {
                 return
             }
 
-            // ЗАПУСК C++ HEV SOCKS5 (Транслятор TUN -> SOCKS5 10808)
+            // ЗАПУСК C++ HEV SOCKS5
             val ymlFile = File(filesDir, "socks.yml")
-            ymlFile.writeText("tunnel:\n  mtu: 1500\nsocks5:\n  port: 10808\n  address: 127.0.0.1\n  udp: 'udp'\nmisc:\n  task-stack-size: 8192")
+            ymlFile.writeText("tunnel:\n  mtu: 1500\nsocks5:\n  port: $proxyPort\n  address: 127.0.0.1\n  udp: 'udp'\nmisc:\n  task-stack-size: 8192")
 
             isRunning = true
             isHevRunning = true
@@ -160,17 +176,27 @@ class MyVpnService : VpnService() {
         }
     }
 
-    private fun generateUltraMinimalConfig(uuid: String): String {
+    private fun isPortAvailable(port: Int): Boolean {
+        return try {
+            ServerSocket(port).use { true }
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private fun generateUltraMinimalConfig(uuid: String, port: Int): String {
         val workerDomain = "dark-poetry-8a03.tio-rex-ultra.workers.dev"
         val cfIp = "104.26.6.213" 
 
+        // Идеально чистый конфиг, который работал 2 шага назад,
+        // но теперь с динамическим портом (без попыток записи файлов)
         return """
         {
           "log": {
             "loglevel": "warning"
           },
           "inbounds": [{
-            "port": 10808,
+            "port": $port,
             "listen": "127.0.0.1",
             "protocol": "socks",
             "settings": { "auth": "noauth", "udp": true }
