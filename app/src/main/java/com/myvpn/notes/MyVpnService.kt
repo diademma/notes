@@ -8,7 +8,6 @@ import android.bluetooth.BluetoothManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
-import android.net.ProxyInfo
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -78,7 +77,7 @@ class MyVpnService : VpnService() {
 
             log("🔑 Чтение UUID: ${uuid.take(8)}...")
 
-            // 1. Настройка виртуального сетевого интерфейса
+            // 1. Создаем чистый сетевой интерфейс TUN без конфликтного HTTP-прокси
             val builder = Builder()
                 .addAddress("10.0.0.2", 32)
                 .addRoute("0.0.0.0", 0)
@@ -86,19 +85,15 @@ class MyVpnService : VpnService() {
                 .addDnsServer("8.8.8.8")
                 .setMtu(1500)
                 .setSession("Заметки")
-                .addDisallowedApplication(packageName) // 🚀 ИСКЛЮЧАЕМ НАШЕ ПРИЛОЖЕНИЕ ИЗ ПЕТЛИ ЗАЦИКЛИВАНИЯ!
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                builder.setHttpProxy(ProxyInfo.buildDirectProxy("127.0.0.1", 10809))
-            }
+                .addDisallowedApplication(packageName) // Исключаем наше приложение из зацикливания
 
             vpnInterface = builder.establish()
 
             vpnInterface?.let { pfd ->
                 val fd = pfd.fd
-                // 2. Привязываем кабель TUN к ядру Xray
+                // 2. Привязываем дескриптор TUN напрямую к ядру Xray
                 Os.setenv("XRAY_TUN_FD", fd.toString(), true)
-                log("🔌 Сетевой кабель TUN #$fd привязан без петли!")
+                log("🔌 TUN кабель #$fd привязан!")
             }
 
             // 3. Запускаем Xray
@@ -110,7 +105,7 @@ class MyVpnService : VpnService() {
             log("🌐 Статус ядра Xray: $result")
 
             isRunning = true
-            log("🎉 ТУННЕЛЬ РАБОТАЕТ В ШТАТНОМ РЕЖИМЕ!")
+            log("🎉 ЧИСТЫЙ ТУННЕЛЬ ПОДНЯТ!")
 
         } catch (e: Exception) {
             log("💥 КРИТИЧЕСКАЯ ОШИБКА: ${e.message}")
@@ -130,17 +125,6 @@ class MyVpnService : VpnService() {
               "settings": {
                 "mtu": 1500
               }
-            },
-            {
-              "port": 10808,
-              "listen": "127.0.0.1",
-              "protocol": "socks",
-              "settings": { "auth": "noauth", "udp": true }
-            },
-            {
-              "port": 10809,
-              "listen": "127.0.0.1",
-              "protocol": "http"
             }
           ],
           "outbounds": [
