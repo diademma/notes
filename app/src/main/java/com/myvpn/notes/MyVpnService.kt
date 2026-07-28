@@ -17,7 +17,6 @@ import androidx.core.app.NotificationCompat
 import com.heiher.hev.socks5.tunnel.HevSocks5Tunnel
 import libXray.LibXray
 import java.io.File
-import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import kotlin.concurrent.thread
@@ -58,7 +57,6 @@ class MyVpnService : VpnService() {
             return START_NOT_STICKY
         }
 
-        // 1. Обязательный запуск Foreground сразу в главном потоке для Android 14+
         createNotificationChannel()
         val notification = createNotification()
 
@@ -72,10 +70,7 @@ class MyVpnService : VpnService() {
             log("⚠️ Уведомление: ${e.message}")
         }
 
-        // 2. Вся тяжелая фоновая инициализация выполняется в отдельном потоке
-        thread {
-            startVpnInternal()
-        }
+        thread { startVpnInternal() }
 
         return START_STICKY
     }
@@ -88,215 +83,138 @@ class MyVpnService : VpnService() {
             val prefs = getSharedPreferences("vpn_prefs", Context.MODE_PRIVATE)
             val uuid = prefs.getString("user_uuid", "d8116f0f-5ad5-4f07-b63b-0877a3113ca2") ?: ""
 
-            log("🔑 Чтение UUID: ${uuid.take(8)}...")
+            log("🔑 UUID: ${uuid.take(8)}...")
 
-            // 1. УБИРАЕМ ТРЕБОВАНИЕ GEOIP: Настраиваем переменные окружения и заглушки
-            val assetDir = filesDir.absolutePath
-            val geoip = File(filesDir, "geoip.dat")
-            if (!geoip.exists()) geoip.createNewFile()
-            val geosite = File(filesDir, "geosite.dat")
-            if (!geosite.exists()) geosite.createNewFile()
-
-            try {
-                System.setProperty("xray.location.asset", assetDir)
-                System.setProperty("XRAY_LOCATION_ASSET", assetDir)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                    android.system.Os.setenv("xray.location.asset", assetDir, true)
-                    android.system.Os.setenv("XRAY_LOCATION_ASSET", assetDir, true)
-                }
-            } catch (e: Throwable) {
-                e.printStackTrace()
-            }
-
-            // Получаем IP адрес сервиса напрямую, чтобы не просить Xray делать поиск по GeoIP
-            val domain = "dark-poetry-8a03.tio-rex-ultra.workers.dev"
-            val targetIp = try {
-                InetAddress.getByName(domain).hostAddress ?: "104.26.6.213"
-            } catch (e: Exception) {
-                "104.26.6.213"
-            }
-            log("🌐 Подключение к IP: $targetIp")
-
-            // Очищаем прошлый запуск ядра при перезапуске
+            // Очистка старых процессов
             try { LibXray.stopXray() } catch (e: Exception) {}
-            Thread.sleep(200)
+            Thread.sleep(300)
 
-            // 2. ЗАПУСКАЕМ XRAY НА ПОРТУ 10808 (SOCKS5)
-            log("⚙️ Запуск ядра Xray...")
-            val rawJson = generateXrayJsonConfig(uuid, targetIp, domain)
+            // 1. ЗАПУСК XRAY (ТОЛЬКО SOCKS -> VLESS)
+            log("⚙️ Запуск ядра...")
+            val rawJson = generateUltraMinimalConfig(uuid)
             val base64Config = Base64.encodeToString(rawJson.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
 
             val result = LibXray.runXray(base64Config)
-            log("ℹ️ Статус Xray: $result")
+            // Если в ответе есть "error", значит JSON битый
+            if (result.contains("error", ignoreCase = true)) {
+                log("❌ Ошибка конфига!")
+            }
 
-            // Ждем готовности порта 10808
+            // Ждем порт 10808
             var attempts = 0
-            while (!checkProxyPort(10808) && attempts < 20) {
-                Thread.sleep(250)
+            while (!checkProxyPort(10808) && attempts < 30) {
+                Thread.sleep(200)
                 attempts++
             }
 
             if (!checkProxyPort(10808)) {
-                log("❌ Xray не успел открыть порт 10808!")
+                log("❌ Порт 10808 не открылся!")
                 stopVpnInternal()
                 return
             }
 
-            log("✅ Порт 10808 готов!")
+            log("✅ Ядро готово!")
 
-            // 3. СОЗДАЕМ СЕТЕВОЙ ИНТЕРФЕЙС TUN С ИСКЛЮЧЕНИЕМ НАШЕГО ПРИЛОЖЕНИЯ
+            // 2. TUN ИНТЕРФЕЙС
             val builder = Builder()
                 .addAddress("10.0.0.2", 24)
                 .addRoute("0.0.0.0", 0)
                 .addDnsServer("1.1.1.1")
-                .addDnsServer("8.8.8.8")
                 .setMtu(1500)
                 .setSession("Заметки")
 
-            try {
-                builder.addDisallowedApplication(packageName)
-            } catch (e: Exception) {
-                log("⚠️ Исключение пакета: ${e.message}")
-            }
+            try { builder.addDisallowedApplication(packageName) } catch (e: Exception) {}
 
             vpnInterface = builder.establish()
+            val tunFd = vpnInterface?.fd ?: -1
 
-            val pfd = vpnInterface
-            if (pfd == null) {
-                log("❌ Сбой получения TUN кабеля!")
+            if (tunFd == -1) {
+                log("❌ Ошибка TUN!")
                 stopVpnInternal()
                 return
             }
 
-            val tunFd = pfd.fd
-            log("✅ TUN кабельный порт: $tunFd")
-
-            // 4. СОЗДАЕМ КОНФИГ ДЛЯ HEV-SOCKS5
+            // 3. HEV SOCKS5 TUNNEL
             val ymlFile = File(filesDir, "socks.yml")
-            if (ymlFile.exists()) ymlFile.delete()
-            ymlFile.writeText(generateHevConfig())
+            ymlFile.writeText("tunnel:\n  mtu: 1500\nsocks5:\n  port: 10808\n  address: 127.0.0.1\n  udp: 'udp'\nmisc:\n  task-stack-size: 8192")
 
-            // 5. ЗАПУСКАЕМ C++ МОДУЛЬ ТУННЕЛИРОВАНИЯ
-            log("🔌 Запуск C++ двигателя (hev-socks5)...")
             isRunning = true
             isHevRunning = true
 
-            thread(name = "HevSocks5Thread") {
+            thread(name = "HevThread") {
                 try {
                     HevSocks5Tunnel.hev_socks5_tunnel_main(ymlFile.absolutePath, tunFd)
                 } catch (e: Throwable) {
-                    log("⚠️ C++ поток завершен: ${e.message}")
+                    log("⚠️ Поток закрыт")
                 } finally {
                     isHevRunning = false
                 }
             }
 
-            log("🎉 ПОБЕДА! Туннель поднят!")
+            log("🎉 СОЕДИНЕНО!")
 
         } catch (e: Exception) {
-            log("💥 ОШИБКА: ${e.message}")
-            e.printStackTrace()
+            log("💥 СБОЙ: ${e.message}")
             stopVpnInternal()
         }
     }
 
     private fun checkProxyPort(port: Int): Boolean {
         return try {
-            Socket().use { socket ->
-                socket.connect(InetSocketAddress("127.0.0.1", port), 300)
-                true
-            }
-        } catch (e: Exception) {
-            false
-        }
+            Socket().use { it.connect(InetSocketAddress("127.0.0.1", port), 300); true }
+        } catch (e: Exception) { false }
     }
 
-    private fun generateHevConfig(): String {
-        return """
-        tunnel:
-          mtu: 1500
+    // МАКСИМАЛЬНО ЧИСТЫЙ КОНФИГ БЕЗ ФАЙЛОВ GEOIP/GEOSITE
+    private fun generateUltraMinimalConfig(uuid: String): String {
+        val workerDomain = "dark-poetry-8a03.tio-rex-ultra.workers.dev"
+        val cfIp = "104.26.6.213" // Прямой IP Cloudflare
 
-        socks5:
-          port: 10808
-          address: 127.0.0.1
-          udp: 'udp'
-
-        misc:
-          task-stack-size: 8192
-        """.trimIndent()
-    }
-
-    private fun generateXrayJsonConfig(uuid: String, targetIp: String, domain: String): String {
         return """
         {
-          "log": {
-            "loglevel": "warning"
-          },
-          "inbounds": [
-            {
-              "port": 10808,
-              "listen": "127.0.0.1",
-              "protocol": "socks",
-              "settings": {
-                "auth": "noauth",
-                "udp": true
-              }
-            }
-          ],
+          "log": { "loglevel": "warning" },
+          "inbounds": [{
+            "port": 10808,
+            "listen": "127.0.0.1",
+            "protocol": "socks",
+            "settings": { "auth": "noauth", "udp": true }
+          }],
           "outbounds": [
             {
-              "tag": "proxy",
               "protocol": "vless",
               "settings": {
-                "vnext": [
-                  {
-                    "address": "$targetIp",
-                    "port": 443,
-                    "users": [
-                      {
-                        "id": "$uuid",
-                        "encryption": "none"
-                      }
-                    ]
-                  }
-                ]
+                "vnext": [{
+                  "address": "$cfIp",
+                  "port": 443,
+                  "users": [{ "id": "$uuid", "encryption": "none", "level": 8 }]
+                }]
               },
               "streamSettings": {
                 "network": "ws",
                 "security": "tls",
                 "tlsSettings": {
-                  "serverName": "$domain",
+                  "serverName": "$workerDomain",
                   "allowInsecure": false,
-                  "fingerprint": "chrome",
-                  "alpn": [
-                    "http/1.1"
-                  ]
+                  "fingerprint": "chrome"
                 },
                 "wsSettings": {
                   "path": "/",
-                  "headers": {
-                    "Host": "$domain"
-                  }
+                  "headers": { "Host": "$workerDomain" }
                 },
                 "sockopt": {
-                  "dialerProxy": "fragment",
-                  "tcpNoDelay": true
+                  "dialerProxy": "fragment"
                 }
-              }
+              },
+              "tag": "proxy"
             },
             {
-              "tag": "fragment",
               "protocol": "freedom",
+              "tag": "fragment",
               "settings": {
                 "fragment": {
                   "packets": "tlshello",
-                  "length": "10-40",
+                  "length": "10-20",
                   "interval": "10-20"
-                }
-              },
-              "streamSettings": {
-                "sockopt": {
-                  "tcpNoDelay": true
                 }
               }
             }
@@ -309,55 +227,34 @@ class MyVpnService : VpnService() {
     private fun stopVpnInternal() {
         if (isStopping) return
         isStopping = true
-        log("🛑 Остановка...")
-
         try {
-            if (isHevRunning) {
-                try { HevSocks5Tunnel.hev_socks5_tunnel_stop() } catch (e: Throwable) {}
-                isHevRunning = false
-            }
-
-            try { LibXray.stopXray() } catch (e: Throwable) {}
-
-            Thread.sleep(100)
-
+            if (isHevRunning) HevSocks5Tunnel.hev_socks5_tunnel_stop()
+            LibXray.stopXray()
+            Thread.sleep(200)
             vpnInterface?.close()
-            vpnInterface = null
-        } catch (e: Exception) {
-            e.printStackTrace()
-        } finally {
-            isRunning = false
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
-            log("👋 Отключено.")
-        }
+        } catch (e: Exception) {}
+        vpnInterface = null
+        isRunning = false
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+        log("👋 Отключено.")
     }
 
-    override fun onDestroy() {
-        stopVpnInternal()
-        super.onDestroy()
-    }
+    override fun onDestroy() { stopVpnInternal(); super.onDestroy() }
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel("vpn_channel", "Служба Заметки", NotificationManager.IMPORTANCE_LOW)
-            getSystemService(NotificationManager::class.java)?.createNotificationChannel(channel)
+            val chan = NotificationChannel("vpn", "VPN", NotificationManager.IMPORTANCE_LOW)
+            getSystemService(NotificationManager::class.java)?.createNotificationChannel(chan)
         }
     }
 
     private fun createNotification(): Notification {
-        val stopIntent = Intent(this, MyVpnService::class.java).apply { action = "STOP" }
-        val pendingStopIntent = PendingIntent.getService(this, 0, stopIntent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-        val openAppIntent = Intent(this, MainActivity::class.java)
-        val pendingOpenIntent = PendingIntent.getActivity(this, 0, openAppIntent, PendingIntent.FLAG_IMMUTABLE)
-
-        return NotificationCompat.Builder(this, "vpn_channel")
+        return NotificationCompat.Builder(this, "vpn")
             .setContentTitle("Заметки")
-            .setContentText("Защищенный режим активен")
+            .setContentText("Защита активна")
             .setSmallIcon(android.R.drawable.ic_menu_edit)
-            .setContentIntent(pendingOpenIntent)
             .setOngoing(true)
-            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Отключиться", pendingStopIntent)
             .build()
     }
 }
