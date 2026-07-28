@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.bluetooth.BluetoothManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -28,7 +29,6 @@ class MyVpnService : VpnService() {
             return START_NOT_STICKY
         }
 
-        // 🛡️ ОДНОРАЗОВАЯ ПРОВЕРКА BLUETOOTH ПРИ СТАРТЕ (0% расхода батареи)
         val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
         val bluetoothAdapter = bluetoothManager?.adapter
 
@@ -51,10 +51,14 @@ class MyVpnService : VpnService() {
 
         createNotificationChannel()
         val notification = createNotification()
-        startForeground(1, notification)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+        } else {
+            startForeground(1, notification)
+        }
 
         try {
-            // Создаем виртуальный TUN интерфейс Android
             val builder = Builder()
                 .addAddress("10.0.0.2", 32)
                 .addRoute("0.0.0.0", 0)
