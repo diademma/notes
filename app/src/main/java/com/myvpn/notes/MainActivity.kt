@@ -1,11 +1,13 @@
 package com.myvpn.notes
 
+import android.Manifest
 import android.app.Activity
 import android.app.StatusBarManager
 import android.bluetooth.BluetoothManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.Icon
@@ -19,6 +21,8 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 
 class MainActivity : AppCompatActivity() {
 
@@ -92,8 +96,19 @@ class MainActivity : AppCompatActivity() {
 
         setContentView(layout)
 
+        // Запрашиваем доступ к уведомлениям
+        checkNotificationPermission()
+
         // Предлагаем добавить плитку в шторку (Android 13+)
         requestTileAddition()
+    }
+
+    private fun checkNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 101)
+            }
+        }
     }
 
     private fun requestTileAddition() {
