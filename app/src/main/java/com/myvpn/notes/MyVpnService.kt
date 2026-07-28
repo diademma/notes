@@ -17,6 +17,8 @@ import androidx.core.app.NotificationCompat
 import libXray.LibXray
 import com.heiher.hev.socks5.tunnel.HevSocks5Tunnel
 import java.io.File
+import java.net.InetSocketAddress
+import java.net.Socket
 import kotlin.concurrent.thread
 
 class MyVpnService : VpnService() {
@@ -79,6 +81,21 @@ class MyVpnService : VpnService() {
             
             LibXray.runXray(base64Config)
 
+            // Ждем и проверяем готовность порта 10808, чтобы C++ модуль не упал!
+            var attempts = 0
+            while (!checkProxyPort(10808) && attempts < 10) {
+                Thread.sleep(200)
+                attempts++
+            }
+
+            if (!checkProxyPort(10808)) {
+                log("❌ Xray не успел открыть порт 10808!")
+                stopVpn()
+                return
+            }
+
+            log("✅ Порт 10808 готов!")
+
             // 2. СОЗДАЕМ СЕТЕВОЙ ИНТЕРФЕЙС TUN
             val builder = Builder()
                 .addAddress("10.0.0.2", 24)
@@ -101,7 +118,7 @@ class MyVpnService : VpnService() {
                 return
             }
 
-            // 3. СОЗДАЕМ КОНФИГ ДЛЯ C++ МОДУЛЯ HEV-SOCKS5
+            // 3. СОЗДАЕМ ВАЛИДНЫЙ КОНФИГ ДЛЯ C++ МОДУЛЯ
             val ymlFile = File(filesDir, "socks.yml")
             if (ymlFile.exists()) ymlFile.delete()
             ymlFile.writeText(generateHevConfig())
@@ -117,12 +134,23 @@ class MyVpnService : VpnService() {
             }
 
             isRunning = true
-            log("🎉 АБСОЛЮТНАЯ ПОБЕДА! C++ Двигатель запущен!")
+            log("🎉 ПОБЕДА! Туннель поднят!")
 
         } catch (e: Exception) {
             log("💥 ОШИБКА: ${e.message}")
             e.printStackTrace()
             stopVpn()
+        }
+    }
+
+    private fun checkProxyPort(port: Int): Boolean {
+        return try {
+            val socket = Socket()
+            socket.connect(InetSocketAddress("127.0.0.1", port), 200)
+            socket.close()
+            true
+        } catch (e: Exception) {
+            false
         }
     }
 
@@ -134,6 +162,7 @@ class MyVpnService : VpnService() {
         socks5:
           port: 10808
           address: 127.0.0.1
+          udp: 'udp'
 
         misc:
           task-stack-size: 8192
