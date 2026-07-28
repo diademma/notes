@@ -19,16 +19,19 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
+      - name: Setup Gradle 8.5
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.5'
+
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
       - name: Build APK with Gradle
-        run: |
-          chmod +x gradlew || true
-          gradle build --no-daemon
+        run: gradle assembleDebug --no-daemon
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MyVpnApp-Release
+          name: Notes-App-Release
           path: app/build/outputs/apk/debug/*.apk
