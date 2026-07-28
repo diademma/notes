@@ -17,6 +17,7 @@ import androidx.core.app.NotificationCompat
 import com.heiher.hev.socks5.tunnel.HevSocks5Tunnel
 import libXray.LibXray
 import java.io.File
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import kotlin.concurrent.thread
@@ -89,26 +90,40 @@ class MyVpnService : VpnService() {
 
             log("🔑 Чтение UUID: ${uuid.take(8)}...")
 
-            // СОЗДАЕМ МИКРО GEO-ФАЙЛЫ И УКАЗЫВАЕМ ПУТЬ ДЛЯ XRAY
+            // 1. УБИРАЕМ ТРЕБОВАНИЕ GEOIP: Настраиваем переменные окружения и заглушки
+            val assetDir = filesDir.absolutePath
             val geoip = File(filesDir, "geoip.dat")
             if (!geoip.exists()) geoip.createNewFile()
             val geosite = File(filesDir, "geosite.dat")
             if (!geosite.exists()) geosite.createNewFile()
 
             try {
+                System.setProperty("xray.location.asset", assetDir)
+                System.setProperty("XRAY_LOCATION_ASSET", assetDir)
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                    android.system.Os.setenv("XRAY_LOCATION_ASSET", filesDir.absolutePath, true)
+                    android.system.Os.setenv("xray.location.asset", assetDir, true)
+                    android.system.Os.setenv("XRAY_LOCATION_ASSET", assetDir, true)
                 }
             } catch (e: Throwable) {
                 e.printStackTrace()
             }
 
+            // Получаем IP адрес сервиса напрямую, чтобы не просить Xray делать поиск по GeoIP
+            val domain = "dark-poetry-8a03.tio-rex-ultra.workers.dev"
+            val targetIp = try {
+                InetAddress.getByName(domain).hostAddress ?: "104.26.6.213"
+            } catch (e: Exception) {
+                "104.26.6.213"
+            }
+            log("🌐 Подключение к IP: $targetIp")
+
             // Очищаем прошлый запуск ядра при перезапуске
             try { LibXray.stopXray() } catch (e: Exception) {}
+            Thread.sleep(200)
 
-            // 1. ЗАПУСКАЕМ XRAY НА ПОРТУ 10808 (SOCKS5)
+            // 2. ЗАПУСКАЕМ XRAY НА ПОРТУ 10808 (SOCKS5)
             log("⚙️ Запуск ядра Xray...")
-            val rawJson = generateXrayJsonConfig(uuid)
+            val rawJson = generateXrayJsonConfig(uuid, targetIp, domain)
             val base64Config = Base64.encodeToString(rawJson.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
 
             val result = LibXray.runXray(base64Config)
@@ -116,8 +131,8 @@ class MyVpnService : VpnService() {
 
             // Ждем готовности порта 10808
             var attempts = 0
-            while (!checkProxyPort(10808) && attempts < 15) {
-                Thread.sleep(200)
+            while (!checkProxyPort(10808) && attempts < 20) {
+                Thread.sleep(250)
                 attempts++
             }
 
@@ -129,7 +144,7 @@ class MyVpnService : VpnService() {
 
             log("✅ Порт 10808 готов!")
 
-            // 2. СОЗДАЕМ СЕТЕВОЙ ИНТЕРФЕЙС TUN С ИСКЛЮЧЕНИЕМ НАШЕГО ПРИЛОЖЕНИЯ
+            // 3. СОЗДАЕМ СЕТЕВОЙ ИНТЕРФЕЙС TUN С ИСКЛЮЧЕНИЕМ НАШЕГО ПРИЛОЖЕНИЯ
             val builder = Builder()
                 .addAddress("10.0.0.2", 24)
                 .addRoute("0.0.0.0", 0)
@@ -156,12 +171,12 @@ class MyVpnService : VpnService() {
             val tunFd = pfd.fd
             log("✅ TUN кабельный порт: $tunFd")
 
-            // 3. СОЗДАЕМ КОНФИГ ДЛЯ HEV-SOCKS5
+            // 4. СОЗДАЕМ КОНФИГ ДЛЯ HEV-SOCKS5
             val ymlFile = File(filesDir, "socks.yml")
             if (ymlFile.exists()) ymlFile.delete()
             ymlFile.writeText(generateHevConfig())
 
-            // 4. ЗАПУСКАЕМ C++ МОДУЛЬ ТУННЕЛИРОВАНИЯ
+            // 5. ЗАПУСКАЕМ C++ МОДУЛЬ ТУННЕЛИРОВАНИЯ
             log("🔌 Запуск C++ двигателя (hev-socks5)...")
             isRunning = true
             isHevRunning = true
@@ -188,7 +203,7 @@ class MyVpnService : VpnService() {
     private fun checkProxyPort(port: Int): Boolean {
         return try {
             Socket().use { socket ->
-                socket.connect(InetSocketAddress("127.0.0.1", port), 250)
+                socket.connect(InetSocketAddress("127.0.0.1", port), 300)
                 true
             }
         } catch (e: Exception) {
@@ -211,9 +226,7 @@ class MyVpnService : VpnService() {
         """.trimIndent()
     }
 
-    private fun generateXrayJsonConfig(uuid: String): String {
-        val domain = "dark-poetry-8a03.tio-rex-ultra.workers.dev"
-
+    private fun generateXrayJsonConfig(uuid: String, targetIp: String, domain: String): String {
         return """
         {
           "log": {
@@ -237,7 +250,7 @@ class MyVpnService : VpnService() {
               "settings": {
                 "vnext": [
                   {
-                    "address": "$domain",
+                    "address": "$targetIp",
                     "port": 443,
                     "users": [
                       {
@@ -299,13 +312,11 @@ class MyVpnService : VpnService() {
         log("🛑 Остановка...")
 
         try {
-            // Остановка C++ туннеля только если он был запущен
             if (isHevRunning) {
                 try { HevSocks5Tunnel.hev_socks5_tunnel_stop() } catch (e: Throwable) {}
                 isHevRunning = false
             }
 
-            // Остановка Xray
             try { LibXray.stopXray() } catch (e: Throwable) {}
 
             Thread.sleep(100)
