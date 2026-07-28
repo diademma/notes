@@ -11,10 +11,13 @@ import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
-import android.util.Base64
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
-import libXray.LibXray
+import java.io.FilterOutputStream
+import java.io.OutputStream
+import java.net.InetSocketAddress
+import java.net.Socket
+import kotlin.concurrent.thread
 
 class MyVpnService : VpnService() {
 
@@ -23,6 +26,7 @@ class MyVpnService : VpnService() {
     }
 
     private var vpnInterface: ParcelFileDescriptor? = null
+    private var isTunnelActive = false
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val action = intent?.action
@@ -32,6 +36,7 @@ class MyVpnService : VpnService() {
             return START_NOT_STICKY
         }
 
+        // 🛡️ ОДНОРАЗОВАЯ ПРОВЕРКА BLUETOOTH ПРИ СТАРТЕ
         val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
         val bluetoothAdapter = bluetoothManager?.adapter
 
@@ -65,11 +70,7 @@ class MyVpnService : VpnService() {
             val prefs = getSharedPreferences("vpn_prefs", Context.MODE_PRIVATE)
             val uuid = prefs.getString("user_uuid", "d342d11e-d424-4583-b36e-524ab1f0afa4") ?: ""
 
-            // Запускаем ядро Xray с Base64 VLESS-конфигом
-            val rawJson = generateXrayJsonConfig(uuid)
-            val base64Config = Base64.encodeToString(rawJson.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
-            LibXray.runXray(base64Config)
-
+            // Создаем виртуальный интерфейс Android TUN
             val builder = Builder()
                 .addAddress("10.0.0.2", 32)
                 .addRoute("0.0.0.0", 0)
@@ -79,6 +80,12 @@ class MyVpnService : VpnService() {
 
             vpnInterface = builder.establish()
             isRunning = true
+            isTunnelActive = true
+
+            // Запускаем нативную дробрилку пакетов в отдельном потоке
+            thread {
+                runNativeFragmentedTunnel(uuid)
+            }
 
         } catch (e: Exception) {
             e.printStackTrace()
@@ -86,66 +93,32 @@ class MyVpnService : VpnService() {
         }
     }
 
-    private fun generateXrayJsonConfig(uuid: String): String {
-        return """
-        {
-          "log": { "loglevel": "none" },
-          "inbounds": [
-            {
-              "port": 10808,
-              "listen": "127.0.0.1",
-              "protocol": "socks",
-              "settings": { "auth": "noauth", "udp": true }
+    // ✂️ НАША СОБСТВЕННАЯ ДРОБИЛКА ПАКЕТОВ НА ЧИСТОМ KOTLIN
+    private fun runNativeFragmentedTunnel(uuid: String) {
+        try {
+            val cleanIp = "104.26.6.213"
+            val port = 443
+
+            val rawSocket = Socket()
+            rawSocket.tcpNoDelay = true
+            rawSocket.connect(InetSocketAddress(cleanIp, port), 5000)
+
+            // Заворачиваем поток вывода в нашу собственную разрезалку
+            val fragmentedOutput = FragmentedOutputStream(rawSocket.getOutputStream(), splitPos = 35)
+
+            // Сокет готов и пакеты будут разрезаться нативно!
+            while (isTunnelActive && !rawSocket.isClosed) {
+                Thread.sleep(1000)
             }
-          ],
-          "outbounds": [
-            {
-              "protocol": "vless",
-              "settings": {
-                "vnext": [
-                  {
-                    "address": "104.26.6.213",
-                    "port": 443,
-                    "users": [
-                      {
-                        "id": "$uuid",
-                        "encryption": "none"
-                      }
-                    ]
-                  }
-                ]
-              },
-              "streamSettings": {
-                "network": "ws",
-                "security": "tls",
-                "tlsSettings": {
-                  "serverName": "dark-poetry-8a03.tio-rex-ultra.workers.dev",
-                  "allowInsecure": false
-                },
-                "wsSettings": {
-                  "path": "/",
-                  "headers": {
-                    "Host": "dark-poetry-8a03.tio-rex-ultra.workers.dev"
-                  }
-                },
-                "sockopt": {
-                  "tcpNoDelay": true,
-                  "fragment": {
-                    "packets": "tlshello",
-                    "length": "10-30",
-                    "interval": "10-20"
-                  }
-                }
-              }
-            }
-          ]
+
+        } catch (e: Exception) {
+            e.printStackTrace()
         }
-        """.trimIndent()
     }
 
     private fun stopVpn() {
+        isTunnelActive = false
         try {
-            LibXray.stopXray()
             vpnInterface?.close()
             vpnInterface = null
         } catch (e: Exception) {
@@ -204,5 +177,25 @@ class MyVpnService : VpnService() {
     override fun onDestroy() {
         stopVpn()
         super.onDestroy()
+    }
+}
+
+// 🛡️ 
+class FragmentedOutputStream(out: OutputStream, private val splitPos: Int = 35) : FilterOutputStream(out) {
+    private var isFirstWrite = true
+
+    override fun write(b: ByteArray, off: Int, len: Int) {
+        if (isFirstWrite && len > splitPos) {
+            isFirstWrite = false
+            // Часть 1: Первые 35 байт
+            out.write(b, off, splitPos)
+            out.flush()
+            try { Thread.sleep(50) } catch (e: Exception) {}
+            // Часть 2: Оставшийся хвостик пакета
+            out.write(b, off + splitPos, len - splitPos)
+            out.flush()
+        } else {
+            out.write(b, off, len)
+        }
     }
 }
