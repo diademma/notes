@@ -17,7 +17,6 @@ import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import libXray.LibXray
 import java.io.File
-import java.io.RandomAccessFile
 import kotlin.concurrent.thread
 
 class MyVpnService : VpnService() {
@@ -81,12 +80,12 @@ class MyVpnService : VpnService() {
 
             log("🔑 Чтение UUID: ${uuid.take(8)}...")
 
-            // 1. Создаем файлы для живых логов Xray
+            // 1. Создаем логи
             val logFile = File(filesDir, "xray_error.log")
             if (logFile.exists()) logFile.delete()
             logFile.createNewFile()
 
-            // 2. Создаем сетевой интерфейс TUN
+            // 2. Настройка виртуального интерфейса TUN
             val builder = Builder()
                 .addAddress("10.0.0.2", 32)
                 .addRoute("0.0.0.0", 0)
@@ -100,16 +99,17 @@ class MyVpnService : VpnService() {
 
             vpnInterface?.let { pfd ->
                 val fd = pfd.fd
+                // Привязываем кабель ДО запуска Xray
                 Os.setenv("XRAY_TUN_FD", fd.toString(), true)
                 log("🔌 TUN кабель #$fd привязан!")
             }
 
-            // 3. Запускаем стример живых логов в реальном времени
+            // 3. Запускаем живой читатель логов
             isTunnelActive = true
             startLiveLogTailer(logFile)
 
-            // 4. Запускаем Xray
-            log("⚙️ Запуск ядра Xray c файлом логов...")
+            // 4. Запускаем Xray со Сниффингом
+            log("⚙️ Запуск ядра Xray со Сниффингом трафика...")
             val rawJson = generateXrayJsonConfig(uuid, logFile.absolutePath)
             val base64Config = Base64.encodeToString(rawJson.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
             
@@ -117,7 +117,7 @@ class MyVpnService : VpnService() {
             log("🌐 Инициализация Xray: $result")
 
             isRunning = true
-            log("🎉 СУПЕР-ТУННЕЛЬ ПОДНЯТ! Ожидание запросов браузера...")
+            log("🎉 СНИФФИНГ ВКЛЮЧЕН! Открывайте сайты в браузере!")
 
         } catch (e: Exception) {
             log("💥 КРИТИЧЕСКАЯ ОШИБКА: ${e.message}")
@@ -126,30 +126,28 @@ class MyVpnService : VpnService() {
         }
     }
 
-    // 📟 ЖИВОЙ СТРИМЕР ЛОГОВ (Читает файл xray_error.log на лету!)
+    // 📟 НАДЕЖНЫЙ СТРИМЕР ЖИВЫХ ЛОГОВ
     private fun startLiveLogTailer(logFile: File) {
         thread {
             try {
-                var lastPointer = 0L
+                var lastPrintedIndex = 0
                 while (isTunnelActive) {
-                    val length = logFile.length()
-                    if (length > lastPointer) {
-                        val raf = RandomAccessFile(logFile, "r")
-                        raf.seek(lastPointer)
-                        var line = raf.readLine()
-                        while (line != null) {
-                            if (line.isNotBlank()) {
-                                log("📜 $line")
+                    if (logFile.exists() && logFile.length() > 0) {
+                        val lines = logFile.readLines()
+                        if (lines.size > lastPrintedIndex) {
+                            for (i in lastPrintedIndex until lines.size) {
+                                val line = lines[i]
+                                if (line.isNotBlank()) {
+                                    log("📜 $line")
+                                }
                             }
-                            line = raf.readLine()
+                            lastPrintedIndex = lines.size
                         }
-                        lastPointer = raf.filePointer
-                        raf.close()
                     }
-                    Thread.sleep(300)
+                    Thread.sleep(400)
                 }
             } catch (e: Exception) {
-                // Игнорируем ошибки чтения лога при остановке
+                // Игнорируем ошибки при остановке
             }
         }
     }
@@ -173,6 +171,11 @@ class MyVpnService : VpnService() {
               "protocol": "tun",
               "settings": {
                 "mtu": 1500
+              },
+              "sniffing": {
+                "enabled": true,
+                "destOverride": ["http", "tls", "quic"],
+                "metadataOnly": false
               }
             }
           ],
