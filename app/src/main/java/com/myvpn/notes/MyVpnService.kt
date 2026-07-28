@@ -78,7 +78,7 @@ class MyVpnService : VpnService() {
 
             log("🔑 Чтение UUID: ${uuid.take(8)}...")
 
-            // 1. Создаем виртуальный интерфейс TUN Android
+            // 1. Настройка виртуального сетевого интерфейса
             val builder = Builder()
                 .addAddress("10.0.0.2", 32)
                 .addRoute("0.0.0.0", 0)
@@ -86,6 +86,7 @@ class MyVpnService : VpnService() {
                 .addDnsServer("8.8.8.8")
                 .setMtu(1500)
                 .setSession("Заметки")
+                .addDisallowedApplication(packageName) // 🚀 ИСКЛЮЧАЕМ НАШЕ ПРИЛОЖЕНИЕ ИЗ ПЕТЛИ ЗАЦИКЛИВАНИЯ!
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 builder.setHttpProxy(ProxyInfo.buildDirectProxy("127.0.0.1", 10809))
@@ -95,12 +96,12 @@ class MyVpnService : VpnService() {
 
             vpnInterface?.let { pfd ->
                 val fd = pfd.fd
-                // 2. Связываем файловый дескриптор TUN с ядром Xray
+                // 2. Привязываем кабель TUN к ядру Xray
                 Os.setenv("XRAY_TUN_FD", fd.toString(), true)
-                log("🔌 Сетевой кабель TUN #$fd успешно привязан!")
+                log("🔌 Сетевой кабель TUN #$fd привязан без петли!")
             }
 
-            // 3. Запускаем ядро Xray
+            // 3. Запускаем Xray
             log("⚙️ Запуск ядра Xray...")
             val rawJson = generateXrayJsonConfig(uuid)
             val base64Config = Base64.encodeToString(rawJson.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
@@ -109,7 +110,7 @@ class MyVpnService : VpnService() {
             log("🌐 Статус ядра Xray: $result")
 
             isRunning = true
-            log("🎉 ТУННЕЛЬ УСПЕШНО ПОДНЯТ И СВЯЗАН С СЕТЬЮ!")
+            log("🎉 ТУННЕЛЬ РАБОТАЕТ В ШТАТНОМ РЕЖИМЕ!")
 
         } catch (e: Exception) {
             log("💥 КРИТИЧЕСКАЯ ОШИБКА: ${e.message}")
