@@ -1,57 +1,55 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.myvpn.notes">
+    xmlns:tools="http://schemas.android.com/tools">
 
+    <!-- Базовые разрешения -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Разрешения службы VPN для Android 14+ -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+
+    <!-- Блютуз (Защита от детей) -->
     <uses-permission android:name="android.permission.BLUETOOTH" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
-    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
         android:allowBackup="true"
-        android:icon="@android:drawable/ic_menu_edit"
+        android:icon="@mipmap/ic_launcher"
         android:label="Заметки"
         android:supportsRtl="true"
-        android:theme="@style/Theme.AppCompat.DayNight.NoActionBar">
+        android:theme="@style/Theme.AppCompat.Light.NoActionBar"
+        tools:targetApi="34">
 
+        <!-- Твой главный экран "Заметки" (НЕ МЕНЯЕТСЯ) -->
         <activity
             android:name=".MainActivity"
-            android:exported="true">
+            android:exported="true"
+            android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
 
+        <!-- Неубиваемый фоновый VPN Сервис -->
         <service
-            android:name=".MyVpnService"
-            android:permission="android.permission.BIND_VPN_SERVICE"
+            android:name=".VibeVpnService"
+            android:exported="false"
             android:foregroundServiceType="specialUse"
-            android:exported="false">
+            android:permission="android.permission.BIND_VPN_SERVICE">
+            
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Encrypted VLESS tunnel for private sync notes" />
+
             <intent-filter>
                 <action android:name="android.net.VpnService" />
             </intent-filter>
-            <property
-                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="VPN Connection" />
-        </service>
-
-        <service
-            android:name=".VpnTileService"
-            android:icon="@android:drawable/ic_menu_edit"
-            android:label="Заметки"
-            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="android.service.quicksettings.action.QS_TILE" />
-            </intent-filter>
-            <meta-data
-                android:name="android.service.quicksettings.ACTIVE_TILE"
-                android:value="true" />
         </service>
 
     </application>
-
 </manifest>
