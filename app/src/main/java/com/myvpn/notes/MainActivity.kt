@@ -1,15 +1,18 @@
 package com.myvpn.notes
 
 import android.app.Activity
+import android.app.StatusBarManager
 import android.bluetooth.BluetoothManager
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.Icon
 import android.net.VpnService
+import android.os.Build
 import android.os.Bundle
 import android.view.Gravity
-import android.view.View
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
@@ -26,7 +29,6 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Глубокий OLED Чёрный фон
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
@@ -43,13 +45,16 @@ class MainActivity : AppCompatActivity() {
         }
 
         uuidInput = EditText(this).apply {
-            hint = "Введите личный ID"
+            hint = "Введите предоставленный вам персональный id"
             setHintTextColor(Color.GRAY)
             setTextColor(Color.WHITE)
-            textSize = 14f
+            textSize = 13f
             gravity = Gravity.CENTER
             val prefs = getSharedPreferences("vpn_prefs", Context.MODE_PRIVATE)
-            setText(prefs.getString("user_uuid", "d342d11e-d424-4583-b36e-524ab1f0afa4"))
+            val savedUuid = prefs.getString("user_uuid", "")
+            if (!savedUuid.isNullOrEmpty()) {
+                setText(savedUuid)
+            }
         }
 
         statusText = TextView(this).apply {
@@ -60,7 +65,6 @@ class MainActivity : AppCompatActivity() {
             setPadding(0, 40, 0, 50)
         }
 
-        // Круглая стильная кнопка
         btnToggle = Button(this).apply {
             text = if (MyVpnService.isRunning) "ВКЛ" else "ВЫКЛ"
             textSize = 20f
@@ -87,6 +91,21 @@ class MainActivity : AppCompatActivity() {
         layout.addView(btnToggle)
 
         setContentView(layout)
+
+        // Предлагаем добавить плитку в шторку (Android 13+)
+        requestTileAddition()
+    }
+
+    private fun requestTileAddition() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val statusBarManager = getSystemService(StatusBarManager::class.java)
+            statusBarManager?.requestAddTileService(
+                ComponentName(this, VpnTileService::class.java),
+                "Заметки",
+                Icon.createWithResource(this, android.R.drawable.ic_menu_edit),
+                mainExecutor
+            ) { }
+        }
     }
 
     override fun onResume() {
@@ -94,7 +113,6 @@ class MainActivity : AppCompatActivity() {
         checkBluetoothOrExit()
     }
 
-    // 🛡️ МОМЕНТАЛЬНЫЙ ВЫЛЕТ ЕЩЕ ДО ОТКРЫТИЯ ЭКРАНА, ЕСЛИ НЕТ БЛЮТУЗА
     private fun checkBluetoothOrExit() {
         val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
         val bluetoothAdapter = bluetoothManager?.adapter
@@ -105,14 +123,14 @@ class MainActivity : AppCompatActivity() {
                 "Ошибка приложения: сбой инициализации модуля (Code: 0x80004005)",
                 Toast.LENGTH_LONG
             ).show()
-            finishAffinity() // Моментально закрываем окно
+            finishAffinity()
         }
     }
 
     private fun handleVpnToggle() {
         val uuid = uuidInput.text.toString().trim()
         if (uuid.isEmpty()) {
-            Toast.makeText(this, "Введите ваш ID!", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "Введите ваш персональный ID!", Toast.LENGTH_SHORT).show()
             return
         }
 
