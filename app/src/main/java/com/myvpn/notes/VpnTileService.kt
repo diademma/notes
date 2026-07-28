@@ -25,7 +25,6 @@ class VpnTileService : TileService() {
             startService(intent)
             updateTileState()
         } else {
-            // 🛡️ ОДНОРАЗОВАЯ ПРОВЕРКА BLUETOOTH В ШТОРКЕ (0% расхода батареи)
             val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
             val bluetoothAdapter = bluetoothManager?.adapter
 
@@ -53,8 +52,13 @@ class VpnTileService : TileService() {
 
     private fun updateTileState() {
         val tile = qsTile ?: return
-        tile.state = if (MyVpnService.isRunning) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
-        tile.label = "Заметки"
+        if (MyVpnService.isRunning) {
+            tile.state = Tile.STATE_ACTIVE
+            tile.label = "Заметки (ВКЛ)"
+        } else {
+            tile.state = Tile.STATE_INACTIVE
+            tile.label = "Заметки"
+        }
         tile.updateTile()
     }
 }
