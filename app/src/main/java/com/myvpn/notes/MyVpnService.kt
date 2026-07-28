@@ -18,8 +18,10 @@ import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.InetAddress
+import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import javax.net.ssl.SNIHostName
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
 import kotlin.concurrent.thread
@@ -37,7 +39,7 @@ class MyVpnService : VpnService() {
     }
 
     private var vpnInterface: ParcelFileDescriptor? = null
-    private var socksServer: PureKotlinSocksServer? = null
+    private var proxyServer: UniversalProxyServer? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val action = intent?.action
@@ -81,17 +83,17 @@ class MyVpnService : VpnService() {
             val prefs = getSharedPreferences("vpn_prefs", Context.MODE_PRIVATE)
             val uuid = prefs.getString("user_uuid", "d8116f0f-5ad5-4f07-b63b-0877a3113ca2") ?: ""
             val workerHost = "dark-poetry-8a03.tio-rex-ultra.workers.dev"
+            val cfIp = "104.26.6.213" // Точный IP из твоего конфига
 
             log("🔑 UUID: ${uuid.take(8)}...")
-            log("🚀 Запуск Чистого Kotlin SOCKS5 Сервера...")
+            log("🌐 Выход на IP: $cfIp (SNI: $workerHost)")
+            log("✂️ Включена TLS-Фрагментация пакетов (Bypass DPI)...")
 
-            // 1. Запускаем чистый Kotlin SOCKS5 Прокси на порту 10808
-            socksServer = PureKotlinSocksServer(uuid, workerHost)
-            socksServer?.start(10808)
+            proxyServer = UniversalProxyServer(uuid, workerHost, cfIp)
+            proxyServer?.start(10808)
 
-            log("✅ Чистый Kotlin Двигатель на порту 10808!")
+            log("✅ Прокси запущен на порту 10808")
 
-            // 2. Настраиваем системный VPN интерфейс
             val builder = Builder()
                 .addAddress("10.0.0.2", 24)
                 .addRoute("0.0.0.0", 0)
@@ -108,10 +110,10 @@ class MyVpnService : VpnService() {
             vpnInterface = builder.establish()
             isRunning = true
 
-            log("🎉 ВПН УСПЕШНО ПОДКЛЮЧЕН (PURE KOTLIN)!")
+            log("🎉 ГОТОВО! Открывай сайт в браузере...")
 
         } catch (e: Exception) {
-            log("💥 КРИТИЧЕСКИЙ СБОЙ: ${e.message}")
+            log("💥 СБОЙ ЗАПУСКА: ${e.message}")
             stopVpnInternal()
         }
     }
@@ -119,8 +121,8 @@ class MyVpnService : VpnService() {
     @Synchronized
     private fun stopVpnInternal() {
         try {
-            socksServer?.stop()
-            socksServer = null
+            proxyServer?.stop()
+            proxyServer = null
             vpnInterface?.close()
             vpnInterface = null
         } catch (e: Exception) {}
@@ -157,16 +159,61 @@ class MyVpnService : VpnService() {
 }
 
 // =========================================================================
-// ЧИСТЫЙ KOTLIN SOCKS5 -> VLESS over WebSocket ДВИЖОК (БЕЗ C++ И GO)
+// ПЕРЕХВАТЧИК И ДРОБИТЕЛЬ ПАКЕТОВ (TLS FRAGMENTATION IN KOTLIN)
 // =========================================================================
-class PureKotlinSocksServer(private val uuid: String, private val workerHost: String) {
+class FragmentingOutputStream(private val delegate: OutputStream) : OutputStream() {
+    private var isFragmented = false
+
+    override fun write(b: Int) { delegate.write(b) }
+
+    override fun write(b: ByteArray, off: Int, len: Int) {
+        // Дробление только первого пакета TLS ClientHello (байты 0x16 0x03)
+        if (!isFragmented && len > 5 && b[off] == 0x16.toByte() && b[off + 1] == 0x03.toByte()) {
+            isFragmented = true
+            val chunk1 = minOf(25, len) // Первый фрагмент: 25 байт
+            delegate.write(b, off, chunk1)
+            delegate.flush()
+
+            try { Thread.sleep(15) } catch (e: Exception) {} // Задержка 15 мс
+
+            val remaining = len - chunk1
+            if (remaining > 0) {
+                delegate.write(b, off + chunk1, remaining) // Второй фрагмент: остаток
+                delegate.flush()
+            }
+        } else {
+            delegate.write(b, off, len)
+        }
+    }
+
+    override fun flush() { delegate.flush() }
+    override fun close() { delegate.close() }
+}
+
+class FragmentedSocket(private val realSocket: Socket) : Socket() {
+    private val fragOut by lazy { FragmentingOutputStream(realSocket.getOutputStream()) }
+    override fun getOutputStream(): OutputStream = fragOut
+    override fun getInputStream(): InputStream = realSocket.getInputStream()
+    override fun close() = realSocket.close()
+    override fun isConnected(): Boolean = realSocket.isConnected
+    override fun isClosed(): Boolean = realSocket.isClosed
+}
+
+// =========================================================================
+// УНИВЕРСАЛЬНЫЙ ДВИЖОК С ВЫХОДОМ НА ПРЯМОЙ IP И ФРАГМЕНТАЦИЕЙ
+// =========================================================================
+class UniversalProxyServer(
+    private val uuid: String,
+    private val workerHost: String,
+    private val cfIp: String
+) {
     private var serverSocket: ServerSocket? = null
     @Volatile private var isRunning = false
 
     fun start(port: Int) {
         isRunning = true
         serverSocket = ServerSocket(port, 50, InetAddress.getByName("127.0.0.1"))
-        thread(name = "KotlinSocksThread") {
+        thread(name = "ProxyThread") {
             while (isRunning) {
                 try {
                     val clientSocket = serverSocket?.accept() ?: break
@@ -188,77 +235,149 @@ class PureKotlinSocksServer(private val uuid: String, private val workerHost: St
             val input = client.getInputStream()
             val output = client.getOutputStream()
 
-            // SOCKS5 Handshake
-            val ver = input.read()
-            if (ver != 5) { client.close(); return }
-            val nmethods = input.read()
-            val methods = ByteArray(nmethods)
-            input.read(methods)
-            output.write(byteArrayOf(0x05, 0x00))
-            output.flush()
-
-            // SOCKS5 Request
-            val ver2 = input.read()
-            val cmd = input.read()
-            input.read() // RSV
-            val atyp = input.read()
+            val firstByte = input.read()
+            if (firstByte == -1) { client.close(); return }
 
             var targetAddr = ""
-            var addrTypeByte: Byte = 0x02 // Domain
+            var targetPort = 80
+            var addrTypeByte: Byte = 0x02
+            var isHttpCONNECT = false
 
-            if (atyp == 1) { // IPv4
-                val ipv4 = ByteArray(4)
-                input.read(ipv4)
-                targetAddr = ipv4.joinToString(".") { (it.toInt() and 0xFF).toString() }
-                addrTypeByte = 0x01
-            } else if (atyp == 3) { // Domain
-                val len = input.read()
-                val domainBytes = ByteArray(len)
-                input.read(domainBytes)
-                targetAddr = String(domainBytes, Charsets.UTF_8)
-                addrTypeByte = 0x02
-            } else if (atyp == 4) { // IPv6
-                val ipv6 = ByteArray(16)
-                input.read(ipv6)
-                targetAddr = "127.0.0.1"
-                addrTypeByte = 0x03
+            if (firstByte == 5) {
+                // SOCKS5
+                val nmethods = input.read()
+                val methods = ByteArray(nmethods)
+                input.read(methods)
+                output.write(byteArrayOf(0x05, 0x00))
+                output.flush()
+
+                input.read(); input.read(); input.read()
+                val atyp = input.read()
+
+                if (atyp == 1) {
+                    val ipv4 = ByteArray(4)
+                    input.read(ipv4)
+                    targetAddr = ipv4.joinToString(".") { (it.toInt() and 0xFF).toString() }
+                    addrTypeByte = 0x01
+                } else if (atyp == 3) {
+                    val len = input.read()
+                    val domainBytes = ByteArray(len)
+                    input.read(domainBytes)
+                    targetAddr = String(domainBytes, Charsets.UTF_8)
+                    addrTypeByte = 0x02
+                } else if (atyp == 4) {
+                    val ipv6 = ByteArray(16)
+                    input.read(ipv6)
+                    targetAddr = "127.0.0.1"
+                    addrTypeByte = 0x03
+                }
+
+                val p1 = input.read()
+                val p2 = input.read()
+                targetPort = (p1 shl 8) or p2
+
+                output.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0))
+                output.flush()
+
+                MyVpnService.log("🌐 [SOCKS5] $targetAddr:$targetPort")
+
+            } else {
+                // HTTP PROXY
+                val lineBytes = ByteArrayOutputStream()
+                lineBytes.write(firstByte)
+                while (true) {
+                    val b = input.read()
+                    if (b == -1 || b == '\n'.code) break
+                    if (b != '\r'.code) lineBytes.write(b)
+                }
+                val requestLine = String(lineBytes.toByteArray(), Charsets.UTF_8)
+
+                val parts = requestLine.split(" ")
+                if (parts.size >= 2) {
+                    val method = parts[0]
+                    val hostPortStr = parts[1]
+
+                    if (method.equals("CONNECT", ignoreCase = true)) {
+                        isHttpCONNECT = true
+                        val hp = hostPortStr.split(":")
+                        targetAddr = hp[0]
+                        targetPort = if (hp.size > 1) hp[1].toIntOrNull() ?: 443 else 443
+                    } else {
+                        var cleanUrl = hostPortStr.replace("http://", "").replace("https://", "")
+                        val slashIdx = cleanUrl.indexOf('/')
+                        if (slashIdx != -1) cleanUrl = cleanUrl.substring(0, slashIdx)
+                        val hp = cleanUrl.split(":")
+                        targetAddr = hp[0]
+                        targetPort = if (hp.size > 1) hp[1].toIntOrNull() ?: 80 else 80
+                    }
+                }
+
+                while (true) {
+                    val hLine = readLine(input)
+                    if (hLine.isEmpty()) break
+                }
+
+                if (isHttpCONNECT) {
+                    output.write("HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray(Charsets.UTF_8))
+                    output.flush()
+                }
+
+                MyVpnService.log("🌐 [HTTP] $targetAddr:$targetPort")
             }
 
-            val p1 = input.read()
-            val p2 = input.read()
-            val targetPort = (p1 shl 8) or p2
+            if (targetAddr.isEmpty()) { client.close(); return }
 
-            // SOCKS5 Reply Success
-            output.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0))
-            output.flush()
-
-            // Подключение к Cloudflare Worker и прокачка VLESS
-            connectToWorkerAndPipe(client, uuid, workerHost, addrTypeByte, targetAddr, targetPort)
+            connectToWorkerAndPipe(client, uuid, workerHost, cfIp, addrTypeByte, targetAddr, targetPort)
 
         } catch (e: Exception) {
+            MyVpnService.log("⚠️ Ошибка: ${e.message}")
             try { client.close() } catch (e2: Exception) {}
         }
+    }
+
+    private fun readLine(input: InputStream): String {
+        val baos = ByteArrayOutputStream()
+        while (true) {
+            val b = input.read()
+            if (b == -1 || b == '\n'.code) break
+            if (b != '\r'.code) baos.write(b)
+        }
+        return String(baos.toByteArray(), Charsets.UTF_8)
     }
 
     private fun connectToWorkerAndPipe(
         client: Socket,
         uuid: String,
         workerHost: String,
+        cfIp: String,
         addrTypeByte: Byte,
         targetAddr: String,
         targetPort: Int
     ) {
         var tlsSocket: Socket? = null
         try {
-            val sslFactory = SSLSocketFactory.getDefault()
-            tlsSocket = sslFactory.createSocket(workerHost, 443)
-            val ssl = tlsSocket as SSLSocket
+            // 1. Создаем сокет НАПРЯМУЮ к IP Cloudflare (104.26.6.213)
+            val rawSocket = Socket()
+            rawSocket.connect(InetSocketAddress(cfIp, 443), 5000)
+
+            // 2. Оборачиваем сокет в сокет-дробитель пакетов
+            val fragSocket = FragmentedSocket(rawSocket)
+
+            // 3. Запускаем SSL поверх раздробленного сокета с указанием SNI
+            val sslFactory = SSLSocketFactory.getDefault() as SSLSocketFactory
+            val ssl = sslFactory.createSocket(fragSocket, workerHost, 443, true) as SSLSocket
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                val params = ssl.sslParameters
+                params.serverNames = listOf(SNIHostName(workerHost))
+                ssl.sslParameters = params
+            }
             ssl.startHandshake()
 
             val tlsIn = ssl.inputStream
             val tlsOut = ssl.outputStream
 
-            // 1. WebSocket Upgrade HTTP Запрос
+            // 4. WebSocket Upgrade Запрос
             val upgradeReq = "GET / HTTP/1.1\r\n" +
                     "Host: $workerHost\r\n" +
                     "Upgrade: websocket\r\n" +
@@ -269,7 +388,6 @@ class PureKotlinSocksServer(private val uuid: String, private val workerHost: St
             tlsOut.write(upgradeReq.toByteArray(Charsets.UTF_8))
             tlsOut.flush()
 
-            // Читаем заголовки ответа HTTP 101
             val headerBuffer = ByteArray(1024)
             var readBytes = 0
             while (readBytes < headerBuffer.size) {
@@ -286,12 +404,12 @@ class PureKotlinSocksServer(private val uuid: String, private val workerHost: St
                 }
             }
 
-            // 2. Формируем 24-байтовый VLESS Заголовок
+            // 5. VLESS 24-байтовый Заголовок
             val vlessHeader = ByteArrayOutputStream()
-            vlessHeader.write(0) // Version
-            vlessHeader.write(uuidToBytes(uuid)) // 16 байт UUID
-            vlessHeader.write(0) // Addon length
-            vlessHeader.write(1) // Command TCP
+            vlessHeader.write(0)
+            vlessHeader.write(uuidToBytes(uuid))
+            vlessHeader.write(0)
+            vlessHeader.write(1)
             vlessHeader.write((targetPort shr 8) and 0xFF)
             vlessHeader.write(targetPort and 0xFF)
             vlessHeader.write(addrTypeByte.toInt())
@@ -302,10 +420,10 @@ class PureKotlinSocksServer(private val uuid: String, private val workerHost: St
             }
             vlessHeader.write(addrBytes)
 
-            // Отправляем VLESS заголовок в WebSocket кадре
             sendWsFrame(tlsOut, vlessHeader.toByteArray())
+            MyVpnService.log("⚡ Успех! Кабель через $cfIp -> $targetAddr:$targetPort")
 
-            // 3. Двунаправленный мост
+            // 6. Прокачка
             val t1 = thread {
                 try {
                     val buffer = ByteArray(8192)
@@ -332,7 +450,7 @@ class PureKotlinSocksServer(private val uuid: String, private val workerHost: St
             t2.join()
 
         } catch (e: Exception) {
-            // Игнорируем закрытие
+            MyVpnService.log("💥 Сбой соединения ($targetAddr): ${e.message}")
         } finally {
             try { client.close() } catch (e: Exception) {}
             try { tlsSocket?.close() } catch (e: Exception) {}
@@ -341,7 +459,7 @@ class PureKotlinSocksServer(private val uuid: String, private val workerHost: St
 
     private fun sendWsFrame(out: OutputStream, payload: ByteArray) {
         val len = payload.size
-        out.write(0x82) // Binary Frame
+        out.write(0x82)
         if (len <= 125) {
             out.write(len or 0x80)
         } else if (len <= 65535) {
