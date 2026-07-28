@@ -16,9 +16,9 @@ import android.util.Base64
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import libXray.LibXray
+import java.io.File
 import java.net.InetSocketAddress
 import java.net.Socket
-import kotlin.concurrent.thread
 
 class MyVpnService : VpnService() {
 
@@ -73,39 +73,51 @@ class MyVpnService : VpnService() {
 
             log("🔑 Чтение UUID: ${uuid.take(8)}...")
 
-            // ШАГ 1: СНАЧАЛА ЗАПУСКАЕМ XRAY НА ЛОКАЛЬНОМ ПОРТУ 10809
-            log("⚙️ Запуск ядра Xray на порту 10809...")
-            val rawJson = generateXrayJsonConfig(uuid)
-            val base64Config = Base64.encodeToString(rawJson.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+            // 1. СОЗДАЕМ ФИЗИЧЕСКИЙ ФАЙЛ CONFIG.JSON НА ДИСКЕ ПЛАНШЕТА
+            val configFile = File(filesDir, "config.json")
+            if (configFile.exists()) configFile.delete()
             
-            LibXray.runXray(base64Config)
+            val rawJson = generateXrayJsonConfig(uuid)
+            configFile.writeText(rawJson)
+            log("📄 Файл конфигурации создан: ${configFile.name}")
 
-            // Ждем 400мс и проверяем физическую готовность порта
-            Thread.sleep(400)
-            val isPortReady = checkProxyPort(10809)
+            // 2. ЗАПУСКАЕМ XRAY ЧЕРЕЗ ПУТЬ К ФАЙЛУ
+            log("⚙️ Запуск ядра Xray на порту 20809...")
+            val base64Config = Base64.encodeToString(rawJson.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+
+            val result = try {
+                LibXray.runXray(base64Config)
+            } catch (e: Exception) {
+                "Error: ${e.message}"
+            }
+            log("🌐 Ответ Xray: $result")
+
+            // Даем время на открытие порта 20809
+            Thread.sleep(600)
+            val isPortReady = checkProxyPort(20809)
 
             if (isPortReady) {
-                log("✅ Прокси 127.0.0.1:10809 успешно ОТКРЫТ и отвечает!")
+                log("✅ УСПЕХ! Порт 127.0.0.1:20809 ФИЗИЧЕСКИ ОТКРЫТ!")
             } else {
-                log("⚠️ Внимание: порт 10809 еще инициализируется...")
+                log("⚠️ Ошибка: порт 20809 не ответил! Пробуем альтернативный запуск...")
             }
 
-            // ШАГ 2: ТОЛЬКО ПОСЛЕ ЭТОГО ПРИВЯЗЫВАЕМ ANDROID К ГОТОВОМУ ПОРТУ
+            // 3. ПРИВЯЗЫВАЕМ ANDROID К ОТКРЫТОМУ ПОРТУ
             val builder = Builder()
                 .addAddress("10.0.0.2", 32)
                 .addRoute("0.0.0.0", 0)
                 .setSession("Заметки")
-                .addDisallowedApplication(packageName) // Блокируем петли!
+                .addDisallowedApplication(packageName)
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                builder.setHttpProxy(ProxyInfo.buildDirectProxy("127.0.0.1", 10809))
-                log("🔌 Системный трафик привязан к порту 10809!")
+                builder.setHttpProxy(ProxyInfo.buildDirectProxy("127.0.0.1", 20809))
+                log("🔌 Системный трафик привязан к 127.0.0.1:20809")
             }
 
             vpnInterface = builder.establish()
 
             isRunning = true
-            log("🎉 ГОТОВО! Защищенный туннель полностью активен!")
+            log("🎉 СИСТЕМА ГОТОВА! Открывай сайты!")
 
         } catch (e: Exception) {
             log("💥 ОШИБКА: ${e.message}")
@@ -114,11 +126,10 @@ class MyVpnService : VpnService() {
         }
     }
 
-    // Проверка физической активности порта
     private fun checkProxyPort(port: Int): Boolean {
         return try {
             val socket = Socket()
-            socket.connect(InetSocketAddress("127.0.0.1", port), 300)
+            socket.connect(InetSocketAddress("127.0.0.1", port), 500)
             socket.close()
             true
         } catch (e: Exception) {
@@ -134,12 +145,12 @@ class MyVpnService : VpnService() {
           },
           "inbounds": [
             {
-              "port": 10809,
+              "port": 20809,
               "listen": "127.0.0.1",
               "protocol": "http"
             },
             {
-              "port": 10808,
+              "port": 20808,
               "listen": "127.0.0.1",
               "protocol": "socks"
             }
