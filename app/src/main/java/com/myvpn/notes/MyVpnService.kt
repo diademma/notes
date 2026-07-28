@@ -11,7 +11,6 @@ import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
-import android.system.Os
 import android.util.Base64
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
@@ -74,7 +73,7 @@ class MyVpnService : VpnService() {
 
             log("🔑 Чтение UUID: ${uuid.take(8)}...")
 
-            // 1. Создаем правильный сетевой интерфейс TUN
+            // 1. Создаем интерфейс TUN
             val builder = Builder()
                 .addAddress("10.0.0.2", 24)
                 .addAddress("fd00::2", 126)
@@ -88,26 +87,32 @@ class MyVpnService : VpnService() {
 
             vpnInterface = builder.establish()
 
+            var tunFd = -1
             vpnInterface?.let { pfd ->
-                val fd = pfd.fd
-                Os.setenv("XRAY_TUN_FD", fd.toString(), true)
-                log("🔌 TUN кабель #$fd привязан!")
+                tunFd = pfd.fd
+                log("🔌 TUN кабель #$tunFd получен от системы!")
             }
 
-            // 2. ЧИТАЕМ СИСТЕМНЫЙ LOGCAT В РЕАЛЬНОМ ВРЕМЕНИ!
+            if (tunFd == -1) {
+                log("❌ Не удалось получить кабель TUN!")
+                stopVpn()
+                return
+            }
+
+            // 2. ЧИТАЕМ LOGCAT В РЕАЛЬНОМ ВРЕМЕНИ
             isTunnelActive = true
             startLogcatReader()
 
-            // 3. ЗАПУСКАЕМ XRAY С СЕТЕВЫМ СТЕКОМ GVISOR
-            log("⚙️ Запуск ядра Xray (стек gVisor)...")
-            val rawJson = generateXrayJsonConfig(uuid)
+            // 3. ЗАПУСКАЕМ XRAY С ПРЯМОЙ ПЕРЕДАЧЕЙ xray.tun.fd ВНУТРИ JSON!
+            log("⚙️ Передаем кабель #$tunFd прямиком в ядро Xray...")
+            val rawJson = generateXrayJsonConfig(uuid, tunFd)
             val base64Config = Base64.encodeToString(rawJson.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
             
             val result = LibXray.runXray(base64Config)
             log("🌐 Ответ ядра Xray: $result")
 
             isRunning = true
-            log("🎉 СТЕК GVISOR ВКЛЮЧЕН! Проверяем интернет!")
+            log("🎉 КАБЕЛЬ ПРИВЯЗАН НАПРЯМУЮ! Открывай сайты!")
 
         } catch (e: Exception) {
             log("💥 КРИТИЧЕСКАЯ ОШИБКА: ${e.message}")
@@ -116,20 +121,19 @@ class MyVpnService : VpnService() {
         }
     }
 
-    // 📟 ПРЯМОЙ ЧИТАТЕЛЬ LOGCAT ЖУРНАЛА ANDROID
+    // 📟 УЛУЧШЕННЫЙ ЧИТАТЕЛЬ LOGCAT (Ловит абсолютно ВСЁ)
     private fun startLogcatReader() {
         thread {
             try {
-                // Очищаем прошлый логcat
                 Runtime.getRuntime().exec("logcat -c")
-                
                 val process = Runtime.getRuntime().exec("logcat -v time")
                 val reader = BufferedReader(InputStreamReader(process.inputStream))
                 var line: String? = reader.readLine()
                 
                 while (isTunnelActive && line != null) {
-                    if (line.contains("Xray") || line.contains("libXray") || line.contains("app/proxy")) {
-                        log("📜 $line")
+                    val lower = line.lowercase()
+                    if (lower.contains("xray") || lower.contains("tun") || lower.contains("vless") || lower.contains("proxy")) {
+                        log("📜 ${line.takeLast(120)}")
                     }
                     line = reader.readLine()
                 }
@@ -137,10 +141,13 @@ class MyVpnService : VpnService() {
         }
     }
 
-    // 🛠 КОНФИГУРАЦИЯ С ОБОЗНАЧЕНИЕМ "stack": "gvisor"
-    private fun generateXrayJsonConfig(uuid: String): String {
+    // 🛠 ПРЯМАЯ ПЕРЕДАЧА "xray.tun.fd": "$tunFd" В JSON!
+    private fun generateXrayJsonConfig(uuid: String, tunFd: Int): String {
         return """
         {
+          "env": {
+            "xray.tun.fd": "$tunFd"
+          },
           "log": {
             "loglevel": "debug"
           },
