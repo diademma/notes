@@ -11,13 +11,10 @@ import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
-import android.util.Base64
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
-import libXray.LibXray
-import java.io.BufferedReader
-import java.io.InputStreamReader
-import kotlin.concurrent.thread
+import io.nec.sopy.singbox.BoxService
+import io.nec.sopy.singbox.CommandServer
 
 class MyVpnService : VpnService() {
 
@@ -31,7 +28,6 @@ class MyVpnService : VpnService() {
     }
 
     private var vpnInterface: ParcelFileDescriptor? = null
-    private var isTunnelActive = false
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val action = intent?.action
@@ -73,46 +69,32 @@ class MyVpnService : VpnService() {
 
             log("🔑 Чтение UUID: ${uuid.take(8)}...")
 
-            // 1. Создаем интерфейс TUN
+            // 1. Создаем сетевой интерфейс
             val builder = Builder()
-                .addAddress("10.0.0.2", 24)
-                .addAddress("fd00::2", 126)
+                .addAddress("172.19.0.1", 30)
+                .addAddress("fdfe:dcba:9876::1", 126)
                 .addRoute("0.0.0.0", 0)
                 .addRoute("::", 0)
                 .addDnsServer("1.1.1.1")
-                .addDnsServer("8.8.8.8")
                 .setMtu(1500)
                 .setSession("Заметки")
                 .addDisallowedApplication(packageName)
 
             vpnInterface = builder.establish()
 
-            var tunFd = -1
-            vpnInterface?.let { pfd ->
-                tunFd = pfd.fd
-                log("🔌 TUN кабель #$tunFd получен от системы!")
-            }
-
-            if (tunFd == -1) {
-                log("❌ Не удалось получить кабель TUN!")
-                stopVpn()
-                return
-            }
-
-            // 2. ЧИТАЕМ LOGCAT В РЕАЛЬНОМ ВРЕМЕНИ
-            isTunnelActive = true
-            startLogcatReader()
-
-            // 3. ЗАПУСКАЕМ XRAY С ПРЯМОЙ ПЕРЕДАЧЕЙ xray.tun.fd ВНУТРИ JSON!
-            log("⚙️ Передаем кабель #$tunFd прямиком в ядро Xray...")
-            val rawJson = generateXrayJsonConfig(uuid, tunFd)
-            val base64Config = Base64.encodeToString(rawJson.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+            // 2. Запускаем ультралегкий движок Sing-Box
+            log("⚙️ Запуск легкого C++ ядра Sing-Box...")
+            val configJson = generateSingBoxJsonConfig(uuid)
             
-            val result = LibXray.runXray(base64Config)
-            log("🌐 Ответ ядра Xray: $result")
+            // Старт высокоскоростного туннеля
+            val pfd = vpnInterface
+            if (pfd != null) {
+                BoxService.start(configJson, pfd.fd)
+                log("🔌 Стек LWIP запущен! Подключение к 104.26.6.213...")
+            }
 
             isRunning = true
-            log("🎉 КАБЕЛЬ ПРИВЯЗАН НАПРЯМУЮ! Открывай сайты!")
+            log("🎉 ГОТОВО! 6-Мегабайтный десант готов к работе!")
 
         } catch (e: Exception) {
             log("💥 КРИТИЧЕСКАЯ ОШИБКА: ${e.message}")
@@ -121,111 +103,57 @@ class MyVpnService : VpnService() {
         }
     }
 
-    // 📟 УЛУЧШЕННЫЙ ЧИТАТЕЛЬ LOGCAT (Ловит абсолютно ВСЁ)
-    private fun startLogcatReader() {
-        thread {
-            try {
-                Runtime.getRuntime().exec("logcat -c")
-                val process = Runtime.getRuntime().exec("logcat -v time")
-                val reader = BufferedReader(InputStreamReader(process.inputStream))
-                var line: String? = reader.readLine()
-                
-                while (isTunnelActive && line != null) {
-                    val lower = line.lowercase()
-                    if (lower.contains("xray") || lower.contains("tun") || lower.contains("vless") || lower.contains("proxy")) {
-                        log("📜 ${line.takeLast(120)}")
-                    }
-                    line = reader.readLine()
-                }
-            } catch (e: Exception) {}
-        }
-    }
-
-    // 🛠 ПРЯМАЯ ПЕРЕДАЧА "xray.tun.fd": "$tunFd" В JSON!
-    private fun generateXrayJsonConfig(uuid: String, tunFd: Int): String {
+    private fun generateSingBoxJsonConfig(uuid: String): String {
         return """
         {
-          "env": {
-            "xray.tun.fd": "$tunFd"
-          },
-          "log": {
-            "loglevel": "debug"
-          },
+          "log": { "level": "panic" },
           "inbounds": [
             {
+              "type": "tun",
               "tag": "tun-in",
-              "protocol": "tun",
-              "settings": {
-                "mtu": 1500,
-                "stack": "gvisor"
-              },
-              "sniffing": {
-                "enabled": true,
-                "destOverride": ["http", "tls", "quic"]
-              }
+              "inet4_address": "172.19.0.1/30",
+              "inet6_address": "fdfe:dcba:9876::1/126",
+              "mtu": 1500,
+              "auto_route": true,
+              "strict_route": true,
+              "stack": "lwip",
+              "sniff": true
             }
           ],
           "outbounds": [
             {
+              "type": "vless",
               "tag": "proxy",
-              "protocol": "vless",
-              "settings": {
-                "vnext": [
-                  {
-                    "address": "104.26.6.213",
-                    "port": 443,
-                    "users": [
-                      {
-                        "id": "$uuid",
-                        "encryption": "none"
-                      }
-                    ]
-                  }
-                ]
+              "server": "104.26.6.213",
+              "server_port": 443,
+              "uuid": "$uuid",
+              "transport": {
+                "type": "ws",
+                "path": "/",
+                "headers": {
+                  "Host": "dark-poetry-8a03.tio-rex-ultra.workers.dev"
+                }
               },
-              "streamSettings": {
-                "network": "ws",
-                "security": "tls",
-                "tlsSettings": {
-                  "serverName": "dark-poetry-8a03.tio-rex-ultra.workers.dev",
-                  "allowInsecure": false
-                },
-                "wsSettings": {
-                  "path": "/",
-                  "headers": {
-                    "Host": "dark-poetry-8a03.tio-rex-ultra.workers.dev"
-                  }
-                },
-                "sockopt": {
-                  "tcpNoDelay": true,
-                  "fragment": {
-                    "packets": "tlshello",
-                    "length": "10-30",
-                    "interval": "10-20"
-                  }
+              "tls": {
+                "enabled": true,
+                "server_name": "dark-poetry-8a03.tio-rex-ultra.workers.dev",
+                "insecure": false,
+                "fragment": {
+                  "enabled": true,
+                  "size": "10-30",
+                  "sleep": "10-20"
                 }
               }
             }
-          ],
-          "routing": {
-            "domainStrategy": "AsIs",
-            "rules": [
-              {
-                "type": "field",
-                "inboundTag": ["tun-in"],
-                "outboundTag": "proxy"
-              }
-            ]
-          }
+          ]
         }
         """.trimIndent()
     }
 
     private fun stopVpn() {
-        isTunnelActive = false
         try {
-            log("🛑 Остановка ядра Xray...")
-            LibXray.stopXray()
+            log("🛑 Остановка ядра...")
+            BoxService.stop()
             vpnInterface?.close()
             vpnInterface = null
         } catch (e: Exception) {}
