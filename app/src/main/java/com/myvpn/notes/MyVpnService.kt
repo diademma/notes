@@ -17,9 +17,6 @@ import androidx.core.app.NotificationCompat
 import com.heiher.hev.socks5.tunnel.HevSocks5Tunnel
 import libXray.LibXray
 import java.io.File
-import java.net.InetSocketAddress
-import java.net.ServerSocket
-import java.net.Socket
 import kotlin.concurrent.thread
 
 class MyVpnService : VpnService() {
@@ -53,7 +50,7 @@ class MyVpnService : VpnService() {
         val bluetoothAdapter = bluetoothManager?.adapter
 
         if (bluetoothAdapter == null || !bluetoothAdapter.isEnabled) {
-            Toast.makeText(this, "Сбой инициализации (Code: 0x80004005)", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "Сбой инициализации", Toast.LENGTH_LONG).show()
             thread { stopVpnInternal() }
             return START_NOT_STICKY
         }
@@ -68,7 +65,7 @@ class MyVpnService : VpnService() {
                 startForeground(1, notification)
             }
         } catch (e: Exception) {
-            log("⚠️ Уведомление: ${e.message}")
+            log("⚠️ Ошибка Foreground: ${e.message}")
         }
 
         thread { startVpnInternal() }
@@ -87,47 +84,39 @@ class MyVpnService : VpnService() {
 
             // Очистка старых процессов
             try { LibXray.stopXray() } catch (e: Exception) {}
-            Thread.sleep(200)
+            Thread.sleep(300)
 
-            // ПОИСК СВОБОДНОГО ПОРТА (ЗАЩИТА ОТ ЗОМБИ-ПРОЦЕССОВ)
-            var proxyPort = 10808
-            while (!isPortAvailable(proxyPort) && proxyPort < 10900) {
-                proxyPort++
-            }
-            log("🔍 Выделен чистый порт: $proxyPort")
-
-            // ПОДГОТОВКА ФАЙЛА ЛОГОВ ЯДРА
-            val logFile = File(filesDir, "xray_core.log")
-            if (logFile.exists()) logFile.delete()
-            logFile.createNewFile()
-
-            // ЗАПУСК ЯДРА
+            // ЗАПУСК ЯДРА XRAY
             log("⚙️ Запуск ядра...")
-            val rawJson = generateUltraMinimalConfig(uuid, proxyPort, logFile.absolutePath)
+            val rawJson = generateUltraMinimalConfig(uuid)
             val base64Config = Base64.encodeToString(rawJson.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
 
-            val result = LibXray.runXray(base64Config)
-            if (result.isNotEmpty()) log("ℹ️ Ответ runXray: $result")
-
-            // ЖДЕМ ПОРТ
-            var attempts = 0
-            while (!checkProxyPort(proxyPort) && attempts < 25) {
-                Thread.sleep(200)
-                attempts++
+            // Получаем ответ (обычно он в Base64)
+            val resultBase64 = LibXray.runXray(base64Config)
+            
+            // Расшифровываем ответ ядра для терминала!
+            val resultText = try {
+                String(Base64.decode(resultBase64, Base64.DEFAULT), Charsets.UTF_8)
+            } catch (e: Exception) {
+                resultBase64
             }
 
-            if (!checkProxyPort(proxyPort)) {
-                // ПОРТ НЕ ОТКРЫЛСЯ - ВЫВОДИМ ИСТИННУЮ ПРИЧИНУ!
-                val errData = if (logFile.exists()) logFile.readText().trim() else "Файл пуст"
-                log("❌ ЯДРО УПАЛО! Причина:")
-                log("📜 $errData")
+            log("ℹ️ Статус ядра: $resultText")
+
+            // Если ядро вернуло ошибку или не содержит success
+            if (resultText.contains("error", ignoreCase = true) || !resultText.contains("success")) {
+                log("❌ ЯДРО ВЫДАЛО ОШИБКУ! Отмена.")
                 stopVpnInternal()
                 return
             }
 
-            log("✅ Ядро успешно село на порт $proxyPort!")
+            log("✅ Ядро успешно запущено!")
+            
+            // Даем ядру полсекунды, чтобы 100% поднять слушатель порта 10808
+            Thread.sleep(500)
 
-            // НАСТРОЙКА TUN
+            // НАСТРОЙКА TUN ИНТЕРФЕЙСА
+            log("🔌 Подключение TUN кабеля...")
             val builder = Builder()
                 .addAddress("10.0.0.2", 24)
                 .addRoute("0.0.0.0", 0)
@@ -141,14 +130,14 @@ class MyVpnService : VpnService() {
             val tunFd = vpnInterface?.fd ?: -1
 
             if (tunFd == -1) {
-                log("❌ Ошибка TUN-интерфейса!")
+                log("❌ Ошибка создания TUN-интерфейса!")
                 stopVpnInternal()
                 return
             }
 
-            // ЗАПУСК HEV SOCKS5
+            // ЗАПУСК C++ HEV SOCKS5 (Транслятор TUN -> SOCKS5 10808)
             val ymlFile = File(filesDir, "socks.yml")
-            ymlFile.writeText("tunnel:\n  mtu: 1500\nsocks5:\n  port: $proxyPort\n  address: 127.0.0.1\n  udp: 'udp'\nmisc:\n  task-stack-size: 8192")
+            ymlFile.writeText("tunnel:\n  mtu: 1500\nsocks5:\n  port: 10808\n  address: 127.0.0.1\n  udp: 'udp'\nmisc:\n  task-stack-size: 8192")
 
             isRunning = true
             isHevRunning = true
@@ -157,47 +146,31 @@ class MyVpnService : VpnService() {
                 try {
                     HevSocks5Tunnel.hev_socks5_tunnel_main(ymlFile.absolutePath, tunFd)
                 } catch (e: Throwable) {
-                    log("⚠️ Сбой потока HEV")
+                    log("⚠️ Поток HEV завершился")
                 } finally {
                     isHevRunning = false
                 }
             }
 
-            log("🎉 СОЕДИНЕНИЕ УСТАНОВЛЕНО!")
+            log("🎉 ВПН УСПЕШНО ПОДКЛЮЧЕН!")
 
         } catch (e: Exception) {
-            log("💥 СБОЙ: ${e.message}")
+            log("💥 КРИТИЧЕСКИЙ СБОЙ: ${e.message}")
             stopVpnInternal()
         }
     }
 
-    private fun isPortAvailable(port: Int): Boolean {
-        return try {
-            ServerSocket(port).use { true }
-        } catch (e: Exception) {
-            false
-        }
-    }
-
-    private fun checkProxyPort(port: Int): Boolean {
-        return try {
-            Socket().use { it.connect(InetSocketAddress("127.0.0.1", port), 200); true }
-        } catch (e: Exception) { false }
-    }
-
-    private fun generateUltraMinimalConfig(uuid: String, port: Int, logPath: String): String {
+    private fun generateUltraMinimalConfig(uuid: String): String {
         val workerDomain = "dark-poetry-8a03.tio-rex-ultra.workers.dev"
         val cfIp = "104.26.6.213" 
 
-        // Идеально чистый конфиг с записью ошибок напрямую в файл
         return """
         {
           "log": {
-            "loglevel": "debug",
-            "error": "$logPath"
+            "loglevel": "warning"
           },
           "inbounds": [{
-            "port": $port,
+            "port": 10808,
             "listen": "127.0.0.1",
             "protocol": "socks",
             "settings": { "auth": "noauth", "udp": true }
