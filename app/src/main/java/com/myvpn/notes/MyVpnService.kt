@@ -93,8 +93,8 @@ class MyVpnService : VpnService() {
 
             vpnInterface = builder.establish()
 
-            if (vpnInterface != null) {
-                val fd = vpnInterface!!.fileDescriptor.fd
+            vpnInterface?.let { pfd ->
+                val fd = pfd.fd
                 // 2. Связываем файловый дескриптор TUN с ядром Xray
                 Os.setenv("XRAY_TUN_FD", fd.toString(), true)
                 log("🔌 Сетевой кабель TUN #$fd успешно привязан!")
