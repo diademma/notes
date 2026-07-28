@@ -18,6 +18,7 @@ import android.view.Gravity
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
@@ -29,23 +30,25 @@ class MainActivity : AppCompatActivity() {
     private lateinit var uuidInput: EditText
     private lateinit var statusText: TextView
     private lateinit var btnToggle: Button
+    private lateinit var logConsole: TextView
+    private lateinit var logScrollView: ScrollView
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
+            gravity = Gravity.CENTER_HORIZONTAL
             setBackgroundColor(Color.BLACK)
-            setPadding(60, 60, 60, 60)
+            setPadding(40, 40, 40, 40)
         }
 
         val titleText = TextView(this).apply {
             text = "Заметки"
-            textSize = 28f
+            textSize = 26f
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER
-            setPadding(0, 0, 0, 40)
+            setPadding(0, 10, 0, 20)
         }
 
         uuidInput = EditText(this).apply {
@@ -63,15 +66,15 @@ class MainActivity : AppCompatActivity() {
 
         statusText = TextView(this).apply {
             text = if (MyVpnService.isRunning) "Статус: Защищено" else "Статус: Отключено"
-            textSize = 16f
+            textSize = 15f
             setTextColor(if (MyVpnService.isRunning) Color.GREEN else Color.GRAY)
             gravity = Gravity.CENTER
-            setPadding(0, 40, 0, 50)
+            setPadding(0, 20, 0, 20)
         }
 
         btnToggle = Button(this).apply {
             text = if (MyVpnService.isRunning) "ВКЛ" else "ВЫКЛ"
-            textSize = 20f
+            textSize = 18f
             setTextColor(Color.WHITE)
             
             val shape = GradientDrawable().apply {
@@ -80,7 +83,7 @@ class MainActivity : AppCompatActivity() {
             }
             background = shape
 
-            layoutParams = LinearLayout.LayoutParams(280, 280).apply {
+            layoutParams = LinearLayout.LayoutParams(220, 220).apply {
                 gravity = Gravity.CENTER
             }
 
@@ -89,17 +92,42 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        // 📟 ТЕРМИНАЛ ДИАГНОСТИКИ И ЛОГОВ ОШИБОК В РЕАЛЬНОМ ВРЕМЕНИ
+        logConsole = TextView(this).apply {
+            text = "> Диагностический терминал готов...\n"
+            textSize = 11f
+            setTextColor(Color.GREEN)
+            setPadding(20, 20, 20, 20)
+        }
+
+        logScrollView = ScrollView(this).apply {
+            setBackgroundColor(Color.parseColor("#111111"))
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                400
+            ).apply {
+                topMargin = 40
+            }
+            addView(logConsole)
+        }
+
         layout.addView(titleText)
         layout.addView(uuidInput)
         layout.addView(statusText)
         layout.addView(btnToggle)
+        layout.addView(logScrollView)
 
         setContentView(layout)
 
-        // Запрашиваем доступ к уведомлениям
-        checkNotificationPermission()
+        // Подключаем слушатель живых логов
+        MyVpnService.onLogMessage = { logMsg ->
+            runOnUiThread {
+                logConsole.append("$logMsg\n")
+                logScrollView.fullScroll(ScrollView.FOCUS_DOWN)
+            }
+        }
 
-        // Предлагаем добавить плитку в шторку (Android 13+)
+        checkNotificationPermission()
         requestTileAddition()
     }
 
