@@ -8,9 +8,11 @@ import android.bluetooth.BluetoothManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ProxyInfo
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.system.Os
 import android.util.Base64
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
@@ -75,24 +77,39 @@ class MyVpnService : VpnService() {
             val uuid = prefs.getString("user_uuid", "d342d11e-d424-4583-b36e-524ab1f0afa4") ?: ""
 
             log("🔑 Чтение UUID: ${uuid.take(8)}...")
-            log("⚙️ Запуск ядра Xray...")
 
-            val rawJson = generateXrayJsonConfig(uuid)
-            val base64Config = Base64.encodeToString(rawJson.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
-            
-            val result = LibXray.runXray(base64Config)
-            log("🌐 Ответ ядра Xray: $result")
-
+            // 1. Создаем виртуальный интерфейс TUN Android
             val builder = Builder()
                 .addAddress("10.0.0.2", 32)
                 .addRoute("0.0.0.0", 0)
                 .addDnsServer("1.1.1.1")
+                .addDnsServer("8.8.8.8")
                 .setMtu(1500)
                 .setSession("Заметки")
 
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                builder.setHttpProxy(ProxyInfo.buildDirectProxy("127.0.0.1", 10809))
+            }
+
             vpnInterface = builder.establish()
+
+            if (vpnInterface != null) {
+                val fd = vpnInterface!!.fileDescriptor.fd
+                // 2. Связываем файловый дескриптор TUN с ядром Xray
+                Os.setenv("XRAY_TUN_FD", fd.toString(), true)
+                log("🔌 Сетевой кабель TUN #$fd успешно привязан!")
+            }
+
+            // 3. Запускаем ядро Xray
+            log("⚙️ Запуск ядра Xray...")
+            val rawJson = generateXrayJsonConfig(uuid)
+            val base64Config = Base64.encodeToString(rawJson.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+            
+            val result = LibXray.runXray(base64Config)
+            log("🌐 Статус ядра Xray: $result")
+
             isRunning = true
-            log("🎉 ТУННЕЛЬ УСПЕШНО ПОДНЯТ!")
+            log("🎉 ТУННЕЛЬ УСПЕШНО ПОДНЯТ И СВЯЗАН С СЕТЬЮ!")
 
         } catch (e: Exception) {
             log("💥 КРИТИЧЕСКАЯ ОШИБКА: ${e.message}")
@@ -107,10 +124,22 @@ class MyVpnService : VpnService() {
           "log": { "loglevel": "info" },
           "inbounds": [
             {
+              "tag": "tun-in",
+              "protocol": "tun",
+              "settings": {
+                "mtu": 1500
+              }
+            },
+            {
               "port": 10808,
               "listen": "127.0.0.1",
               "protocol": "socks",
               "settings": { "auth": "noauth", "udp": true }
+            },
+            {
+              "port": 10809,
+              "listen": "127.0.0.1",
+              "protocol": "http"
             }
           ],
           "outbounds": [
@@ -160,7 +189,7 @@ class MyVpnService : VpnService() {
 
     private fun stopVpn() {
         try {
-            log("🛑 Остановка ядра Xray и закрытие сокетов...")
+            log("🛑 Остановка ядра Xray...")
             LibXray.stopXray()
             vpnInterface?.close()
             vpnInterface = null
