@@ -6,12 +6,12 @@ pluginManagement {
     }
 }
 dependencyResolutionManagement {
-    repositoriesMode.set(DependencyResolutionManagement.RepositoriesMode.FAIL_ON_PROJECT_REPOSITORIES)
     repositories {
         google()
         mavenCentral()
         maven { url 'https://jitpack.io' }
     }
 }
-rootProject.name = "Notes"
+
+rootProject.name = "Заметки"
 include ':app'
