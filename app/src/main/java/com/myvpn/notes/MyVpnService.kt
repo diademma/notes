@@ -36,6 +36,8 @@ class MyVpnService : VpnService() {
     private var vpnInterface: ParcelFileDescriptor? = null
     @Volatile
     private var isStopping = false
+    @Volatile
+    private var isHevRunning = false
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val action = intent?.action
@@ -86,6 +88,20 @@ class MyVpnService : VpnService() {
             val uuid = prefs.getString("user_uuid", "d8116f0f-5ad5-4f07-b63b-0877a3113ca2") ?: ""
 
             log("🔑 Чтение UUID: ${uuid.take(8)}...")
+
+            // СОЗДАЕМ МИКРО GEO-ФАЙЛЫ И УКАЗЫВАЕМ ПУТЬ ДЛЯ XRAY
+            val geoip = File(filesDir, "geoip.dat")
+            if (!geoip.exists()) geoip.createNewFile()
+            val geosite = File(filesDir, "geosite.dat")
+            if (!geosite.exists()) geosite.createNewFile()
+
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                    android.system.Os.setenv("XRAY_LOCATION_ASSET", filesDir.absolutePath, true)
+                }
+            } catch (e: Throwable) {
+                e.printStackTrace()
+            }
 
             // Очищаем прошлый запуск ядра при перезапуске
             try { LibXray.stopXray() } catch (e: Exception) {}
@@ -148,12 +164,15 @@ class MyVpnService : VpnService() {
             // 4. ЗАПУСКАЕМ C++ МОДУЛЬ ТУННЕЛИРОВАНИЯ
             log("🔌 Запуск C++ двигателя (hev-socks5)...")
             isRunning = true
+            isHevRunning = true
 
             thread(name = "HevSocks5Thread") {
                 try {
                     HevSocks5Tunnel.hev_socks5_tunnel_main(ymlFile.absolutePath, tunFd)
                 } catch (e: Throwable) {
                     log("⚠️ C++ поток завершен: ${e.message}")
+                } finally {
+                    isHevRunning = false
                 }
             }
 
@@ -280,16 +299,17 @@ class MyVpnService : VpnService() {
         log("🛑 Остановка...")
 
         try {
-            // 1. Остановка C++ туннеля ДО закрытия дескриптора сокета
-            try { HevSocks5Tunnel.hev_socks5_tunnel_stop() } catch (e: Throwable) {}
+            // Остановка C++ туннеля только если он был запущен
+            if (isHevRunning) {
+                try { HevSocks5Tunnel.hev_socks5_tunnel_stop() } catch (e: Throwable) {}
+                isHevRunning = false
+            }
 
-            // 2. Остановка Xray
+            // Остановка Xray
             try { LibXray.stopXray() } catch (e: Throwable) {}
 
-            // Небольшая задержка, чтобы C++ поток успел выйти из цикла без SIGSEGV
             Thread.sleep(100)
 
-            // 3. Закрытие TUN интерфейса
             vpnInterface?.close()
             vpnInterface = null
         } catch (e: Exception) {
