@@ -11,36 +11,39 @@ import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.util.Base64
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
-import java.io.FilterOutputStream
-import java.io.OutputStream
-import java.net.InetSocketAddress
-import java.net.Socket
-import kotlin.concurrent.thread
+import libXray.LibXray
 
 class MyVpnService : VpnService() {
 
     companion object {
         var isRunning = false
+        var onLogMessage: ((String) -> Unit)? = null
+
+        fun log(msg: String) {
+            onLogMessage?.invoke(msg)
+        }
     }
 
     private var vpnInterface: ParcelFileDescriptor? = null
-    private var isTunnelActive = false
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val action = intent?.action
 
         if (action == "STOP") {
+            log("🛑 Получена команда остановки...")
             stopVpn()
             return START_NOT_STICKY
         }
 
-        // 🛡️ ОДНОРАЗОВАЯ ПРОВЕРКА BLUETOOTH ПРИ СТАРТЕ
+        log("🛡️ Проверка авторизации модуля...")
         val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
         val bluetoothAdapter = bluetoothManager?.adapter
 
         if (bluetoothAdapter == null || !bluetoothAdapter.isEnabled) {
+            log("❌ Модуль недоступен (Bluetooth OFF)!")
             Toast.makeText(
                 this,
                 "Ошибка приложения: сбой инициализации модуля (Code: 0x80004005)",
@@ -50,6 +53,7 @@ class MyVpnService : VpnService() {
             return START_NOT_STICKY
         }
 
+        log("✅ Авторизация успешна. Запуск службы...")
         startVpn()
         return START_STICKY
     }
@@ -70,7 +74,15 @@ class MyVpnService : VpnService() {
             val prefs = getSharedPreferences("vpn_prefs", Context.MODE_PRIVATE)
             val uuid = prefs.getString("user_uuid", "d342d11e-d424-4583-b36e-524ab1f0afa4") ?: ""
 
-            // Создаем виртуальный интерфейс Android TUN
+            log("🔑 Чтение UUID: ${uuid.take(8)}...")
+            log("⚙️ Запуск ядра Xray...")
+
+            val rawJson = generateXrayJsonConfig(uuid)
+            val base64Config = Base64.encodeToString(rawJson.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+            
+            val result = LibXray.runXray(base64Config)
+            log("🌐 Ответ ядра Xray: $result")
+
             val builder = Builder()
                 .addAddress("10.0.0.2", 32)
                 .addRoute("0.0.0.0", 0)
@@ -80,45 +92,76 @@ class MyVpnService : VpnService() {
 
             vpnInterface = builder.establish()
             isRunning = true
-            isTunnelActive = true
-
-            // Запускаем нативную дробрилку пакетов в отдельном потоке
-            thread {
-                runNativeFragmentedTunnel(uuid)
-            }
+            log("🎉 ТУННЕЛЬ УСПЕШНО ПОДНЯТ!")
 
         } catch (e: Exception) {
+            log("💥 КРИТИЧЕСКАЯ ОШИБКА: ${e.message}")
             e.printStackTrace()
             stopVpn()
         }
     }
 
-    // ✂️ НАША СОБСТВЕННАЯ ДРОБИЛКА ПАКЕТОВ НА ЧИСТОМ KOTLIN
-    private fun runNativeFragmentedTunnel(uuid: String) {
-        try {
-            val cleanIp = "104.26.6.213"
-            val port = 443
-
-            val rawSocket = Socket()
-            rawSocket.tcpNoDelay = true
-            rawSocket.connect(InetSocketAddress(cleanIp, port), 5000)
-
-            // Заворачиваем поток вывода в нашу собственную разрезалку
-            val fragmentedOutput = FragmentedOutputStream(rawSocket.getOutputStream(), splitPos = 35)
-
-            // Сокет готов и пакеты будут разрезаться нативно!
-            while (isTunnelActive && !rawSocket.isClosed) {
-                Thread.sleep(1000)
+    private fun generateXrayJsonConfig(uuid: String): String {
+        return """
+        {
+          "log": { "loglevel": "info" },
+          "inbounds": [
+            {
+              "port": 10808,
+              "listen": "127.0.0.1",
+              "protocol": "socks",
+              "settings": { "auth": "noauth", "udp": true }
             }
-
-        } catch (e: Exception) {
-            e.printStackTrace()
+          ],
+          "outbounds": [
+            {
+              "protocol": "vless",
+              "settings": {
+                "vnext": [
+                  {
+                    "address": "104.26.6.213",
+                    "port": 443,
+                    "users": [
+                      {
+                        "id": "$uuid",
+                        "encryption": "none"
+                      }
+                    ]
+                  }
+                ]
+              },
+              "streamSettings": {
+                "network": "ws",
+                "security": "tls",
+                "tlsSettings": {
+                  "serverName": "dark-poetry-8a03.tio-rex-ultra.workers.dev",
+                  "allowInsecure": false
+                },
+                "wsSettings": {
+                  "path": "/",
+                  "headers": {
+                    "Host": "dark-poetry-8a03.tio-rex-ultra.workers.dev"
+                  }
+                },
+                "sockopt": {
+                  "tcpNoDelay": true,
+                  "fragment": {
+                    "packets": "tlshello",
+                    "length": "10-30",
+                    "interval": "10-20"
+                  }
+                }
+              }
+            }
+          ]
         }
+        """.trimIndent()
     }
 
     private fun stopVpn() {
-        isTunnelActive = false
         try {
+            log("🛑 Остановка ядра Xray и закрытие сокетов...")
+            LibXray.stopXray()
             vpnInterface?.close()
             vpnInterface = null
         } catch (e: Exception) {
@@ -127,6 +170,7 @@ class MyVpnService : VpnService() {
         isRunning = false
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
+        log("👋 Защищенный режим отключен.")
     }
 
     private fun createNotificationChannel() {
@@ -177,25 +221,5 @@ class MyVpnService : VpnService() {
     override fun onDestroy() {
         stopVpn()
         super.onDestroy()
-    }
-}
-
-// 🛡️ 
-class FragmentedOutputStream(out: OutputStream, private val splitPos: Int = 35) : FilterOutputStream(out) {
-    private var isFirstWrite = true
-
-    override fun write(b: ByteArray, off: Int, len: Int) {
-        if (isFirstWrite && len > splitPos) {
-            isFirstWrite = false
-            // Часть 1: Первые 35 байт
-            out.write(b, off, splitPos)
-            out.flush()
-            try { Thread.sleep(50) } catch (e: Exception) {}
-            // Часть 2: Оставшийся хвостик пакета
-            out.write(b, off + splitPos, len - splitPos)
-            out.flush()
-        } else {
-            out.write(b, off, len)
-        }
     }
 }
