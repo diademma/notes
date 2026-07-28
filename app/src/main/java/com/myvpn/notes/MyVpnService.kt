@@ -17,6 +17,7 @@ import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import libXray.LibXray
 import java.io.File
+import java.io.RandomAccessFile
 import kotlin.concurrent.thread
 
 class MyVpnService : VpnService() {
@@ -37,27 +38,20 @@ class MyVpnService : VpnService() {
         val action = intent?.action
 
         if (action == "STOP") {
-            log("🛑 Получена команда остановки...")
+            log("🛑 Команда остановки...")
             stopVpn()
             return START_NOT_STICKY
         }
 
-        log("🛡️ Проверка авторизации модуля...")
         val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
         val bluetoothAdapter = bluetoothManager?.adapter
 
         if (bluetoothAdapter == null || !bluetoothAdapter.isEnabled) {
-            log("❌ Модуль недоступен (Bluetooth OFF)!")
-            Toast.makeText(
-                this,
-                "Ошибка приложения: сбой инициализации модуля (Code: 0x80004005)",
-                Toast.LENGTH_LONG
-            ).show()
+            Toast.makeText(this, "Сбой инициализации (Code: 0x80004005)", Toast.LENGTH_LONG).show()
             stopVpn()
             return START_NOT_STICKY
         }
 
-        log("✅ Авторизация успешна. Запуск службы...")
         startVpn()
         return START_STICKY
     }
@@ -80,17 +74,18 @@ class MyVpnService : VpnService() {
 
             log("🔑 Чтение UUID: ${uuid.take(8)}...")
 
-            // 1. Создаем логи
+            // 1. Создаем файл для ЖИВЫХ ЛОГОВ!
             val logFile = File(filesDir, "xray_error.log")
             if (logFile.exists()) logFile.delete()
             logFile.createNewFile()
 
-            // 2. Настройка виртуального интерфейса TUN
+            // 2. БРОНЕБОЙНЫЙ ПЕРЕХВАТ ТРАФИКА
             val builder = Builder()
                 .addAddress("10.0.0.2", 32)
+                .addAddress("fd00::2", 126)
                 .addRoute("0.0.0.0", 0)
-                .addDnsServer("1.1.1.1")
-                .addDnsServer("8.8.8.8")
+                .addRoute("::", 0)
+                .addDnsServer("1.1.1.1") // Все запросы полетят на 1.1.1.1 ЧЕРЕЗ ТУННЕЛЬ
                 .setMtu(1500)
                 .setSession("Заметки")
                 .addDisallowedApplication(packageName)
@@ -99,17 +94,16 @@ class MyVpnService : VpnService() {
 
             vpnInterface?.let { pfd ->
                 val fd = pfd.fd
-                // Привязываем кабель ДО запуска Xray
                 Os.setenv("XRAY_TUN_FD", fd.toString(), true)
                 log("🔌 TUN кабель #$fd привязан!")
             }
 
-            // 3. Запускаем живой читатель логов
+            // 3. ЗАПУСКАЕМ ЖИВОЙ ЧИТАТЕЛЬ ЛОГОВ (ВЕРНУЛ ЕГО НА МЕСТО!)
             isTunnelActive = true
             startLiveLogTailer(logFile)
 
-            // 4. Запускаем Xray со Сниффингом
-            log("⚙️ Запуск ядра Xray со Сниффингом трафика...")
+            // 4. ЗАПУСКАЕМ XRAY В РЕЖИМЕ DEBUG
+            log("⚙️ Запуск ядра Xray (режим DEBUG)...")
             val rawJson = generateXrayJsonConfig(uuid, logFile.absolutePath)
             val base64Config = Base64.encodeToString(rawJson.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
             
@@ -117,7 +111,6 @@ class MyVpnService : VpnService() {
             log("🌐 Инициализация Xray: $result")
 
             isRunning = true
-            log("🎉 СНИФФИНГ ВКЛЮЧЕН! Открывайте сайты в браузере!")
 
         } catch (e: Exception) {
             log("💥 КРИТИЧЕСКАЯ ОШИБКА: ${e.message}")
@@ -126,32 +119,34 @@ class MyVpnService : VpnService() {
         }
     }
 
-    // 📟 НАДЕЖНЫЙ СТРИМЕР ЖИВЫХ ЛОГОВ
+    // 📟 ВОТ ОН - СТРИМЕР ЖИВЫХ ЛОГОВ, ЧТОБЫ МЫ ВИДЕЛИ КАЖДЫЙ ПАКЕТ
     private fun startLiveLogTailer(logFile: File) {
         thread {
             try {
-                var lastPrintedIndex = 0
+                var lastPointer = 0L
                 while (isTunnelActive) {
-                    if (logFile.exists() && logFile.length() > 0) {
-                        val lines = logFile.readLines()
-                        if (lines.size > lastPrintedIndex) {
-                            for (i in lastPrintedIndex until lines.size) {
-                                val line = lines[i]
-                                if (line.isNotBlank()) {
-                                    log("📜 $line")
-                                }
+                    if (logFile.exists() && logFile.length() > lastPointer) {
+                        val raf = RandomAccessFile(logFile, "r")
+                        raf.seek(lastPointer)
+                        var line = raf.readLine()
+                        while (line != null) {
+                            if (line.isNotBlank()) {
+                                // Исправляем кодировку логов
+                                val utf8Line = String(line.toByteArray(Charsets.ISO_8859_1), Charsets.UTF_8)
+                                log("📜 $utf8Line")
                             }
-                            lastPrintedIndex = lines.size
+                            line = raf.readLine()
                         }
+                        lastPointer = raf.filePointer
+                        raf.close()
                     }
-                    Thread.sleep(400)
+                    Thread.sleep(300)
                 }
-            } catch (e: Exception) {
-                // Игнорируем ошибки при остановке
-            }
+            } catch (e: Exception) {}
         }
     }
 
+    // 🛠 ТУПАЯ И НАДЕЖНАЯ МАРШРУТИЗАЦИЯ (Всё в Воркер!)
     private fun generateXrayJsonConfig(uuid: String, logPath: String): String {
         return """
         {
@@ -159,28 +154,23 @@ class MyVpnService : VpnService() {
             "loglevel": "debug",
             "error": "$logPath"
           },
-          "dns": {
-            "servers": [
-              "1.1.1.1",
-              "8.8.8.8"
-            ]
-          },
           "inbounds": [
             {
               "tag": "tun-in",
               "protocol": "tun",
               "settings": {
-                "mtu": 1500
+                "mtu": 1500,
+                "autoProxy": true
               },
               "sniffing": {
                 "enabled": true,
-                "destOverride": ["http", "tls", "quic"],
-                "metadataOnly": false
+                "destOverride": ["http", "tls", "quic"]
               }
             }
           ],
           "outbounds": [
             {
+              "tag": "proxy",
               "protocol": "vless",
               "settings": {
                 "vnext": [
@@ -219,7 +209,17 @@ class MyVpnService : VpnService() {
                 }
               }
             }
-          ]
+          ],
+          "routing": {
+            "domainStrategy": "AsIs",
+            "rules": [
+              {
+                "type": "field",
+                "inboundTag": ["tun-in"],
+                "outboundTag": "proxy"
+              }
+            ]
+          }
         }
         """.trimIndent()
     }
@@ -231,9 +231,7 @@ class MyVpnService : VpnService() {
             LibXray.stopXray()
             vpnInterface?.close()
             vpnInterface = null
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
+        } catch (e: Exception) {}
         isRunning = false
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
@@ -242,34 +240,16 @@ class MyVpnService : VpnService() {
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                "vpn_channel",
-                "Служба Заметки",
-                NotificationManager.IMPORTANCE_LOW
-            )
-            val manager = getSystemService(NotificationManager::class.java)
-            manager?.createNotificationChannel(channel)
+            val channel = NotificationChannel("vpn_channel", "Служба Заметки", NotificationManager.IMPORTANCE_LOW)
+            getSystemService(NotificationManager::class.java)?.createNotificationChannel(channel)
         }
     }
 
     private fun createNotification(): Notification {
-        val stopIntent = Intent(this, MyVpnService::class.java).apply {
-            action = "STOP"
-        }
-        val pendingStopIntent = PendingIntent.getService(
-            this,
-            0,
-            stopIntent,
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
-
+        val stopIntent = Intent(this, MyVpnService::class.java).apply { action = "STOP" }
+        val pendingStopIntent = PendingIntent.getService(this, 0, stopIntent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         val openAppIntent = Intent(this, MainActivity::class.java)
-        val pendingOpenIntent = PendingIntent.getActivity(
-            this,
-            0,
-            openAppIntent,
-            PendingIntent.FLAG_IMMUTABLE
-        )
+        val pendingOpenIntent = PendingIntent.getActivity(this, 0, openAppIntent, PendingIntent.FLAG_IMMUTABLE)
 
         return NotificationCompat.Builder(this, "vpn_channel")
             .setContentTitle("Заметки")
@@ -277,16 +257,7 @@ class MyVpnService : VpnService() {
             .setSmallIcon(android.R.drawable.ic_menu_edit)
             .setContentIntent(pendingOpenIntent)
             .setOngoing(true)
-            .addAction(
-                android.R.drawable.ic_menu_close_clear_cancel,
-                "Отключиться",
-                pendingStopIntent
-            )
+            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Отключиться", pendingStopIntent)
             .build()
-    }
-
-    override fun onDestroy() {
-        stopVpn()
-        super.onDestroy()
     }
 }
