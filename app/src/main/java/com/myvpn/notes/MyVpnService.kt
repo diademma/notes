@@ -70,7 +70,7 @@ class MyVpnService : VpnService() {
 
         try {
             val prefs = getSharedPreferences("vpn_prefs", Context.MODE_PRIVATE)
-            val uuid = prefs.getString("user_uuid", "d342d11e-d424-4583-b36e-524ab1f0afa4") ?: ""
+            val uuid = prefs.getString("user_uuid", "d8116f0f-5ad5-4f07-b63b-0877a3113ca2") ?: ""
 
             log("🔑 Чтение UUID: ${uuid.take(8)}...")
 
@@ -170,6 +170,9 @@ class MyVpnService : VpnService() {
     }
 
     private fun generateXrayJsonConfig(uuid: String): String {
+        val domain = "dark-poetry-8a03.tio-rex-ultra.workers.dev"
+        val cleanIp = "104.26.6.213"
+
         return """
         {
           "log": {
@@ -188,11 +191,12 @@ class MyVpnService : VpnService() {
           ],
           "outbounds": [
             {
+              "tag": "proxy",
               "protocol": "vless",
               "settings": {
                 "vnext": [
                   {
-                    "address": "104.26.6.213",
+                    "address": "$cleanIp",
                     "port": 443,
                     "users": [
                       {
@@ -207,22 +211,38 @@ class MyVpnService : VpnService() {
                 "network": "ws",
                 "security": "tls",
                 "tlsSettings": {
-                  "serverName": "dark-poetry-8a03.tio-rex-ultra.workers.dev",
-                  "allowInsecure": false
+                  "serverName": "$domain",
+                  "allowInsecure": false,
+                  "fingerprint": "chrome",
+                  "alpn": [
+                    "http/1.1"
+                  ]
                 },
                 "wsSettings": {
                   "path": "/",
                   "headers": {
-                    "Host": "dark-poetry-8a03.tio-rex-ultra.workers.dev"
+                    "Host": "$domain"
                   }
                 },
                 "sockopt": {
-                  "tcpNoDelay": true,
-                  "fragment": {
-                    "packets": "tlshello",
-                    "length": "10-30",
-                    "interval": "10-20"
-                  }
+                  "dialerProxy": "fragment",
+                  "tcpNoDelay": true
+                }
+              }
+            },
+            {
+              "tag": "fragment",
+              "protocol": "freedom",
+              "settings": {
+                "fragment": {
+                  "packets": "tlshello",
+                  "length": "10-40",
+                  "interval": "10-20"
+                }
+              },
+              "streamSettings": {
+                "sockopt": {
+                  "tcpNoDelay": true
                 }
               }
             }
